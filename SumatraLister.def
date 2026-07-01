@@ -1,0 +1,22 @@
+; SumatraLister.def
+; Exports the WLX (Lister plugin) API with plain, undecorated names so that
+; Total Commander (which loads these by name via GetProcAddress) can find
+; them regardless of calling-convention name-mangling.
+
+LIBRARY SumatraLister
+
+EXPORTS
+    ListGetDetectString
+    ListLoad
+    ListLoadW
+    ListLoadNext
+    ListLoadNextW
+    ListCloseWindow
+    ListSendCommand
+    ListSearchText
+    ListSearchTextW
+    ListGetPreviewBitmap
+    ListGetPreviewBitmapW
+    ListPrint
+    ListPrintW
+    ListSetDefaultParams
