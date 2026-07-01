@@ -192,7 +192,13 @@ static std::wstring GetIniPath()
 
 static std::wstring GetLogPath()
 {
-    return GetModuleDir() + L"\\SumatraLister.log";
+    // Computed once (thread-safe static local init) rather than re-deriving
+    // the module's own path via GetModuleFileNameW on every LogF call --
+    // the DLL's location can't change during its own lifetime, so repeating
+    // that lookup per log line was pure avoidable overhead on a path that
+    // can be called many times during an active troubleshooting session.
+    static const std::wstring path = GetModuleDir() + L"\\SumatraLister.log";
+    return path;
 }
 
 // Lightweight debug logger; no-op unless DebugLog=1 in the INI. Guarded by
@@ -213,22 +219,39 @@ static void LogF(const wchar_t* fmt, ...)
 
     std::lock_guard<std::mutex> lock(g_logMutex);
 
-    std::wstring path = GetLogPath();
+    const std::wstring& path = GetLogPath();
 
     // Simple rotation: once the log passes ~2MB, start fresh rather than
     // growing forever across a long-running Total Commander session.
-    WIN32_FILE_ATTRIBUTE_DATA fad;
-    if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad)) {
-        ULONGLONG sizeBytes = (((ULONGLONG)fad.nFileSizeHigh) << 32) | fad.nFileSizeLow;
-        if (sizeBytes > 2ull * 1024 * 1024)
-            DeleteFileW(path.c_str());
+    //
+    // Size is tracked in-memory after an initial seed rather than re-stat'ing
+    // the file via GetFileAttributesExW on every call: every byte ever
+    // written to this log goes through this same function under this same
+    // mutex, so once we know the starting size (from one real stat, lazily
+    // done on the first log call of this DLL's lifetime), we can just keep a
+    // running total ourselves instead of asking the filesystem again each time.
+    static bool      sizeSeeded    = false;
+    static ULONGLONG approxSizeBytes = 0;
+
+    if (!sizeSeeded) {
+        WIN32_FILE_ATTRIBUTE_DATA fad;
+        if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad))
+            approxSizeBytes = (((ULONGLONG)fad.nFileSizeHigh) << 32) | fad.nFileSizeLow;
+        sizeSeeded = true;
+    }
+
+    if (approxSizeBytes > 2ull * 1024 * 1024) {
+        DeleteFileW(path.c_str());
+        approxSizeBytes = 0;
     }
 
     FILE* f = nullptr;
     if (_wfopen_s(&f, path.c_str(), L"a, ccs=UTF-8") == 0 && f) {
         SYSTEMTIME st; GetLocalTime(&st);
-        fwprintf(f, L"[%02d:%02d:%02d] %s\n", st.wHour, st.wMinute, st.wSecond, buf);
-        fclose(f);
+        int written = fwprintf(f, L"[%02d:%02d:%02d] %s\n", st.wHour, st.wMinute, st.wSecond, buf);
+        if (written > 0)
+            approxSizeBytes += (ULONGLONG)written * sizeof(wchar_t); // approximate; exact byte count isn't worth another stat
+        (void)fclose(f); // best-effort log write; nothing actionable to do if the close itself fails here
     }
 }
 
@@ -254,8 +277,14 @@ static void LoadConfigImpl()
     g_config.enablePopOut      = GetPrivateProfileIntW(L"Settings", L"EnablePopOut", 0, ini.c_str()) != 0;
     g_config.debugLog          = GetPrivateProfileIntW(L"Settings", L"DebugLog", 0, ini.c_str()) != 0;
 
-    int timeout = GetPrivateProfileIntW(L"Settings", L"EmbedTimeoutMs", 4000, ini.c_str());
-    g_config.embedTimeoutMs = (DWORD)std::max(500, std::min(timeout, 30000)); // sane clamp: 0.5s-30s
+    UINT timeoutRaw = GetPrivateProfileIntW(L"Settings", L"EmbedTimeoutMs", 4000, ini.c_str());
+    // Clamped entirely in unsigned space (matching GetPrivateProfileIntW's
+    // actual UINT return type) rather than round-tripping through a signed
+    // int first: a malformed/negative INI value can make GetPrivateProfileInt
+    // return a huge UINT (e.g. "-1" -> UINT_MAX), and converting that to int
+    // before clamping would rely on implementation-defined signed/unsigned
+    // conversion behavior instead of just clamping the unsigned value directly.
+    g_config.embedTimeoutMs = (timeoutRaw < 500) ? 500 : (timeoutRaw > 30000 ? 30000 : timeoutRaw);
 
     GetPrivateProfileStringW(L"Settings", L"DefaultZoom", L"", buf, _countof(buf), ini.c_str());
     g_config.defaultZoom = buf;
@@ -349,7 +378,7 @@ static std::wstring AnsiToWide(const char* s)
     if (len <= 0)
         return std::wstring(); // malformed for this code page; fail safe rather than crash
 
-    std::vector<wchar_t> buf(len);
+    std::vector<wchar_t> buf(static_cast<size_t>(len));
     MultiByteToWideChar(CP_ACP, 0, s, -1, buf.data(), len);
     return std::wstring(buf.data());
 }
@@ -367,7 +396,18 @@ static bool FileExistsW(const std::wstring& path)
 static bool ReadRegString(HKEY root, const std::wstring& subKey, const std::wstring& valueName,
                            std::wstring& out)
 {
-    const REGSAM views[] = { 0, KEY_WOW64_64KEY, KEY_WOW64_32KEY };
+    // Only two views are ever meaningfully distinct for a given build: the
+    // default (0, native to this process) and whichever WOW64 flag isn't a
+    // no-op for that bitness. A 64-bit process's default view already IS
+    // the 64-bit view (KEY_WOW64_64KEY would just repeat it); a 32-bit
+    // process is already WOW64-redirected to the 32-bit view by default
+    // (KEY_WOW64_32KEY would just repeat it). Trying all three unconditionally
+    // meant one RegOpenKeyExW call per subkey was always a wasted duplicate.
+#ifdef _WIN64
+    const REGSAM views[] = { 0, KEY_WOW64_32KEY };
+#else
+    const REGSAM views[] = { 0, KEY_WOW64_64KEY };
+#endif
     for (REGSAM extra : views) {
         HKEY hKey;
         if (RegOpenKeyExW(root, subKey.c_str(), 0, KEY_READ | extra, &hKey) == ERROR_SUCCESS) {
@@ -419,13 +459,19 @@ static std::wstring FindSumatraPDF()
     // 1) App Paths (set by the Sumatra installer for both per-user / per-machine installs)
     if (ReadRegString(HKEY_CURRENT_USER,
                        L"Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\SumatraPDF.exe",
-                       L"", path) && FileExistsW(path = StripQuotesAndArgs(path)))
-        return path;
+                       L"", path)) {
+        path = StripQuotesAndArgs(path);
+        if (FileExistsW(path))
+            return path;
+    }
 
     if (ReadRegString(HKEY_LOCAL_MACHINE,
                        L"Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\SumatraPDF.exe",
-                       L"", path) && FileExistsW(path = StripQuotesAndArgs(path)))
-        return path;
+                       L"", path)) {
+        path = StripQuotesAndArgs(path);
+        if (FileExistsW(path))
+            return path;
+    }
 
     // 2) Sumatra's own uninstall / install-dir registry keys
     const wchar_t* uninstallKeys[] = {
@@ -578,18 +624,19 @@ static LRESULT CALLBACK HostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
     }
 }
 
+static std::once_flag g_hostClassOnceFlag;
+
 static void EnsureHostClassRegistered()
 {
-    static bool registered = false;
-    if (registered) return;
-    WNDCLASSW wc = {};
-    wc.lpfnWndProc   = HostWndProc;
-    wc.hInstance     = g_hInst;
-    wc.lpszClassName = HOST_CLASS_NAME;
-    wc.hCursor       = LoadCursorW(nullptr, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
-    RegisterClassW(&wc);
-    registered = true;
+    std::call_once(g_hostClassOnceFlag, []() {
+        WNDCLASSW wc = {};
+        wc.lpfnWndProc   = HostWndProc;
+        wc.hInstance     = g_hInst;
+        wc.lpszClassName = HOST_CLASS_NAME;
+        wc.hCursor       = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+        RegisterClassW(&wc);
+    });
 }
 
 static HWND WaitForSumatraChild(HWND hostWnd, HANDLE hProcess, DWORD processId, DWORD timeoutMs)
@@ -617,7 +664,7 @@ static HWND WaitForSumatraChild(HWND hostWnd, HANDLE hProcess, DWORD processId, 
         }
         if (found) break;
         Sleep(pollIntervalMs);
-        if (pollIntervalMs < 50) pollIntervalMs += 10; // gentle backoff to ease CPU use if it's slow to start
+        if (pollIntervalMs < 50) pollIntervalMs = std::min(pollIntervalMs + 10, 50ul); // hard-cap at 50ms
     }
     return found;
 }
@@ -637,6 +684,25 @@ static void AppendQuotedArg(std::wstring& cmd, const std::wstring& arg)
     cmd += L" \"";
     cmd += arg;
     cmd += L'"';
+}
+
+// Converts a pointer-sized handle (HWND, HINSTANCE, ...) to its decimal
+// string form, e.g. for the "-plugin <hwnd>" command line and for logging.
+// The cast through `long long` looks redundant on a 64-bit-only build --
+// GCC's -Wuseless-cast flags it there -- but this same source file also
+// builds a 32-bit target (SumatraLister.wlx), where intptr_t is only 32
+// bits. Passing a 32-bit vararg to a %lld format specifier (which always
+// reads 64 bits) is a real stack-argument-width mismatch, not a style nit:
+// verified empirically against GCC's own -Wformat on a 32-bit build, which
+// flags precisely this shape of call, and the actual bytes read past the
+// pushed argument are unspecified stack contents -- correct-looking output
+// in testing would be luck, not a guarantee. Widening through `long long`
+// here keeps the vararg's actual width matching the format specifier on
+// both targets, which is why this one warning is deliberately left in a
+// strict x64-only build rather than "fixed" by dropping the cast.
+static long long HandleToInt64(void* handle)
+{
+    return static_cast<long long>(reinterpret_cast<intptr_t>(handle));
 }
 
 // ---------------------------------------------------------------------------
@@ -754,7 +820,7 @@ static bool LaunchSumatraEmbedded(ListerInstance* inst)
     int page = ExtractPageSuffix(filePath); // strips "#page=N" if present
 
     wchar_t hwndBuf[32];
-    swprintf_s(hwndBuf, L"%lld", (long long)(intptr_t)inst->hostWnd);
+    swprintf_s(hwndBuf, L"%lld", HandleToInt64(inst->hostWnd));
 
     std::wstring cmdLine = L"\"" + exe + L"\"";
     AppendArg(cmdLine, L"-plugin");
@@ -880,7 +946,7 @@ static bool TryFallbackShellOpen(const std::wstring& filePath)
     HINSTANCE result = ShellExecuteW(nullptr, L"open", filePath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
     bool ok = (intptr_t)result > 32; // per ShellExecute convention
     if (!ok)
-        LogF(L"FallbackToShellOpen failed, ShellExecute returned %lld", (long long)(intptr_t)result);
+    LogF(L"FallbackToShellOpen failed, ShellExecute returned %lld", HandleToInt64(result));
     return ok;
 }
 
@@ -915,18 +981,19 @@ static LRESULT CALLBACK ErrorWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
+static std::once_flag g_errorClassOnceFlag;
+
 static void EnsureErrorClassRegistered()
 {
-    static bool registered = false;
-    if (registered) return;
-    WNDCLASSW wc = {};
-    wc.lpfnWndProc   = ErrorWndProc;
-    wc.hInstance     = g_hInst;
-    wc.lpszClassName = L"SumatraListerErrorWnd";
-    wc.hCursor       = LoadCursorW(nullptr, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
-    RegisterClassW(&wc);
-    registered = true;
+    std::call_once(g_errorClassOnceFlag, []() {
+        WNDCLASSW wc = {};
+        wc.lpfnWndProc   = ErrorWndProc;
+        wc.hInstance     = g_hInst;
+        wc.lpszClassName = L"SumatraListerErrorWnd";
+        wc.hCursor       = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+        RegisterClassW(&wc);
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -945,13 +1012,13 @@ static void SendKeyCombo(bool ctrl, WORD vk)
     int   n = 0;
     if (ctrl) { down[n].type = INPUT_KEYBOARD; down[n].ki.wVk = VK_CONTROL; n++; }
     down[n].type = INPUT_KEYBOARD; down[n].ki.wVk = vk; n++;
-    SendInput(n, down, sizeof(INPUT));
+    SendInput(static_cast<UINT>(n), down, sizeof(INPUT)); // n is 1-2, bounded by the array size above
 
     INPUT up[2] = {};
     n = 0;
     up[n].type = INPUT_KEYBOARD; up[n].ki.wVk = vk; up[n].ki.dwFlags = KEYEVENTF_KEYUP; n++;
     if (ctrl) { up[n].type = INPUT_KEYBOARD; up[n].ki.wVk = VK_CONTROL; up[n].ki.dwFlags = KEYEVENTF_KEYUP; n++; }
-    SendInput(n, up, sizeof(INPUT));
+    SendInput(static_cast<UINT>(n), up, sizeof(INPUT)); // n is 1-2, bounded by the array size above
 }
 
 static bool SetClipboardTextW(const std::wstring& text)
@@ -971,6 +1038,32 @@ static bool SetClipboardTextW(const std::wstring& text)
     return hMem != nullptr;
 }
 
+// Reads the clipboard's current CF_UNICODETEXT content, if any. Used to
+// save/restore the user's clipboard around ForwardFindToSumatra's
+// paste-into-find-box trick, which would otherwise silently overwrite
+// whatever the user last copied (potentially something they still meant to
+// paste elsewhere) every time they used Lister's Find dialog.
+static bool GetClipboardTextW(std::wstring& out)
+{
+    if (!IsClipboardFormatAvailable(CF_UNICODETEXT))
+        return false;
+    if (!OpenClipboard(nullptr))
+        return false;
+
+    bool ok = false;
+    HANDLE hData = GetClipboardData(CF_UNICODETEXT);
+    if (hData) {
+        const wchar_t* src = (const wchar_t*)GlobalLock(hData);
+        if (src) {
+            out = src;
+            ok = true;
+            GlobalUnlock(hData);
+        }
+    }
+    CloseClipboard();
+    return ok;
+}
+
 // Opens Sumatra's find bar and (optionally) types/searches for `text`.
 static void ForwardFindToSumatra(ListerInstance* inst, const std::wstring* text)
 {
@@ -982,12 +1075,27 @@ static void ForwardFindToSumatra(ListerInstance* inst, const std::wstring* text)
     Sleep(120);
 
     if (text && !text->empty()) {
+        std::wstring savedClipboard;
+        bool hadClipboardText = GetClipboardTextW(savedClipboard);
+
         SendKeyCombo(true, 'A'); // select any existing text in the find box
         Sleep(30);
         if (SetClipboardTextW(*text)) {
             SendKeyCombo(true, 'V'); // paste search text
             Sleep(30);
             SendKeyCombo(false, VK_RETURN); // execute search
+
+            // Give Sumatra a moment to actually process the paste and the
+            // search before we touch the clipboard again -- restoring too
+            // early could overwrite our search text before Sumatra's own
+            // thread gets around to reading it, pasting stale content instead.
+            Sleep(50);
+            if (hadClipboardText)
+                SetClipboardTextW(savedClipboard);
+            // If there was nothing on the clipboard before (or it held a
+            // non-text format we don't track), we leave the search text in
+            // place rather than actively clearing it -- we only restore
+            // content we know we clobbered.
         }
     }
 }
@@ -1105,9 +1213,30 @@ static int DoListPrint(const std::wstring& fileToPrint, const std::wstring& prin
 
     // -print-to[-default] makes Sumatra print and exit on its own; wait
     // (bounded) for that exit so TC's print dialog/status reflects completion.
-    WaitForSingleObject(pi.hProcess, 60000);
+    DWORD waitResult = WaitForSingleObject(pi.hProcess, 60000);
+
+    if (waitResult == WAIT_TIMEOUT) {
+        // Sumatra didn't exit in time -- don't silently report success for
+        // a print job we never actually confirmed finished. Terminate the
+        // runaway process rather than just closing our handle to it, which
+        // would leave it running indefinitely with nothing tracking it.
+        // (This can't guarantee the print spooler/printer itself stops --
+        // only that Sumatra's own process does.)
+        LogF(L"Print job did not finish within 60s, terminating");
+        TerminateProcess(pi.hProcess, 0);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        return LISTPLUGIN_ERROR;
+    }
+
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
+
+    if (waitResult != WAIT_OBJECT_0) {
+        LogF(L"WaitForSingleObject on print process failed, error %lu", GetLastError());
+        return LISTPLUGIN_ERROR;
+    }
+
     return LISTPLUGIN_OK;
 }
 
@@ -1430,6 +1559,13 @@ __declspec(dllexport) HBITMAP __stdcall ListGetPreviewBitmap(
 }
 
 // --- ListPrintW / ListPrint: non-interactive printing via Sumatra's CLI ---
+// Note: `margins` (custom print margins TC may pass) is intentionally not
+// forwarded to Sumatra. Sumatra manages its own print margins via
+// -print-settings rather than accepting page-margin hints from the caller,
+// and TC's exact units/semantics for this RECT aren't something this plugin
+// has confirmed -- guessing at a translation risks silently WRONG margins
+// (clipped content) rather than the current, honest no-op. Set PrintSettings=
+// in the INI if you need specific margins.
 __declspec(dllexport) int __stdcall ListPrintW(
     HWND /*ListWin*/, WCHAR* FileToPrint, WCHAR* DefPrinter, int /*PrintFlags*/, RECT /*margins*/)
 {

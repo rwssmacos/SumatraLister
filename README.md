@@ -65,11 +65,39 @@ been compiled and linked (via MinGW-w64, both `x86_64-w64-mingw32-g++` and
 `i686-w64-mingw32-g++`) into real, loadable `PE32`/`PE32+` DLLs with all 14
 expected entry points present under their correct undecorated names
 (`ListLoad`, `ListLoadW`, `ListGetPreviewBitmap`, `ListPrintW`, etc. — verified
-via `objdump -p`'s export table), and separately checked with `cppcheck`
-for logic issues beyond what the compiler catches. A few real bugs were
-caught and fixed this way during development — see Notes / limitations below
-for the ones worth knowing about even now that they're fixed, and the
-in-source comments at each fix site for the specifics.
+via `objdump -p`'s export table). It's also been checked with `cppcheck` and,
+separately, `clang-tidy` (an independent static-analysis engine from a
+different vendor than GCC, run against both `bugprone-*`/`cert-*` and
+`performance-*` checks) — plus GCC with a much stricter warning set than a
+typical build uses (`-Wshadow -Wconversion -Wsign-conversion -Wuseless-cast`
+and friends) on both architectures. Every finding from all of these was
+individually reviewed: some were real bugs (fixed, see below), some were
+verified-safe Windows/cross-architecture idioms a generic linter can't have
+context for (documented in-source rather than "fixed" in a way that would
+actually break something), and none were left unexamined.
+
+**Bugs found and fixed by this process** (beyond what's described inline at
+each fix site in the source):
+- `ForwardFindToSumatra` (Lister's Find dialog) was silently overwriting the
+  system clipboard with the search text and never restoring what was there
+  before — every search clobbered whatever the user had last copied. Now
+  saves and restores it.
+- `ListPrint`'s 60-second wait for Sumatra to finish printing discarded the
+  wait's actual result: a timeout was silently reported as success, and the
+  still-running process was never terminated, just abandoned. Now a timeout
+  is reported as failure and the runaway process is terminated.
+- An early draft of the pop-out feature subclassed Sumatra's own window with
+  a `WNDPROC` from this DLL — which doesn't work, since that window belongs
+  to a different process and a code pointer from one process is meaningless
+  in another. Replaced with `RegisterHotKey`, the mechanism actually designed
+  for this.
+- A host window left showing the "Sumatra not found" error pane by one
+  failed launch attempt stayed stuck in that state even after a later
+  attempt succeeded (e.g. Sumatra gets installed partway through a session),
+  silently breaking resize/focus/hotkey handling for that pane from then on.
+- Registry-view probing during Sumatra detection tried 3 `KEY_WOW64_*`
+  variations per key when at most 2 are ever meaningfully different for a
+  given build — the third was always a wasted duplicate.
 
 ## How it works
 
@@ -222,5 +250,14 @@ PDF, CHM, DJVU, EPUB, FB2, FB2Z, MOBI, PRC, XPS, OXPS, CB7, CBR, CBT, CBZ
   returns no bitmap and TC falls back to its default icon — it won't crash.
 - `ListPrint` waits for Sumatra's print job to finish and exit before
   returning, up to a 60-second timeout; very large documents on a slow
-  printer could exceed it. This wait happens on whichever thread Total
-  Commander calls `ListPrint` on.
+  printer could exceed it, in which case the plugin now reports failure and
+  terminates the still-running Sumatra process rather than leaving it
+  orphaned. This wait happens on whichever thread Total Commander calls
+  `ListPrint` on.
+- `ListPrint` does not forward custom print margins from Total Commander
+  (the `margins` parameter). Sumatra manages its own print margins via
+  `-print-settings` rather than accepting page-margin hints from the caller,
+  and this plugin doesn't have confirmed knowledge of TC's exact units for
+  that parameter — guessing at a translation risked silently wrong (clipped)
+  output, which seemed worse than the current explicit no-op. Use
+  `PrintSettings=` in the INI if you need specific margins.
