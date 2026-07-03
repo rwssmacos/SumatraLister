@@ -259,6 +259,17 @@ Build **both** if your Total Commander install could be either bitness —
 TC auto-selects the matching file by extension (`.wlx` for 32-bit TC,
 `.wlx64` for 64-bit TC).
 
+**About `warning LNK4070`**: if you see something like `/OUT:SumatraLister.dll
+directive in .EXP differs from output filename '...SumatraLister.wlx64';
+ignoring directive`, that's expected and harmless — it's MSVC noticing that
+`SumatraLister.def` doesn't hardcode an output name (deliberately, since
+this same `.def` file is shared by both the 32-bit and 64-bit builds, which
+produce different filenames) and just falling back to the real one you
+asked for. It only affects programs that implicitly/statically link
+against the generated `.lib`; Total Commander loads this plugin via
+`LoadLibrary`+`GetProcAddress` instead, which never touches that metadata.
+See the comment in `SumatraLister.def` for the full explanation.
+
 ### MinGW-w64
 
 ```bash

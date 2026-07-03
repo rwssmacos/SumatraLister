@@ -2,8 +2,19 @@
 ; Exports the WLX (Lister plugin) API with plain, undecorated names so that
 ; Total Commander (which loads these by name via GetProcAddress) can find
 ; them regardless of calling-convention name-mangling.
-
-LIBRARY SumatraLister
+;
+; Deliberately no LIBRARY statement here: this .def file is shared by both
+; the 32-bit build (output SumatraLister.wlx) and the 64-bit build (output
+; SumatraLister.wlx64). A hardcoded LIBRARY name always mismatches one of
+; the two, which MSVC reports as LNK4070 ("/OUT:... directive in .EXP
+; differs from output filename ...; ignoring directive") at final link
+; time. The warning is harmless either way -- it only matters for programs
+; that implicitly/statically link against the generated .lib, and Total
+; Commander instead loads this plugin via LoadLibrary + GetProcAddress by
+; name, which never touches that metadata -- but omitting LIBRARY avoids it
+; entirely for both architectures: without it, the linker derives the
+; expected name from the real /OUT: target rather than from a static string
+; here, so there's nothing left to mismatch.
 
 EXPORTS
     ListGetDetectString
