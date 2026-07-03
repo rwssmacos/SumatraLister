@@ -49,6 +49,11 @@
 //     mechanism) instead of a fixed setting.
 //   - Quick View Panel (Ctrl+Q) focus notification (ITM_FOCUS), so its
 //     header highlights correctly when the embedded pane gains focus.
+//   - Crash detection: if an embedded Sumatra process exits unexpectedly
+//     (crash, killed externally) rather than via this plugin's own
+//     intentional close, the pane switches to an accurate message instead
+//     of staying a dead, unresponsive blank window. Uses a thread-pool wait
+//     on the process handle (RegisterWaitForSingleObject), not polling.
 //   - Optional pop-out hotkey (EnablePopOut=1, off by default): Ctrl+Alt+O
 //     reopens the current file in a normal, full SumatraPDF window with its
 //     menu/toolbar, for actions the embedded view doesn't expose (Save As,
@@ -166,6 +171,17 @@
 // Quick View Panel (Ctrl+Q) that this pane gained focus, so its header
 // highlights correctly.
 #define ITM_FOCUS 0xFFF8
+
+// Custom message (private to this plugin, not part of the WLX API): posted
+// to a host window by ProcessExitCallback when its embedded Sumatra process
+// exits. See RegisterCrashDetection.
+#define WM_SUMATRA_PROCESS_EXITED (WM_APP + 1)
+
+// GWLP_USERDATA values for ErrorWndProc, set alongside the WNDPROC swap at
+// each call site that switches a pane into its error/fallback display.
+#define ERRSTATE_NOT_FOUND        0  // Sumatra couldn't be found/started at all
+#define ERRSTATE_OPENED_EXTERNAL  1  // FallbackToShellOpen kicked in instead
+#define ERRSTATE_CRASHED          2  // was embedded and working, then the process exited unexpectedly
 
 // return codes
 #define LISTPLUGIN_OK       0
@@ -379,6 +395,7 @@ struct ListerInstance {
     bool               currentInvert = false;  // effective -invertcolors state of the running process
     bool               closed        = false;  // true once TeardownInstance has run; guards reuse-after-close
     int                hotkeyId      = 0;       // RegisterHotKey id for pop-out, 0 = not registered
+    HANDLE             processWaitHandle = nullptr; // RegisterWaitForSingleObject handle; see ProcessExitCallback
     std::mutex         opLock;                 // serializes launch/relaunch/close for *this* instance,
                                                 // held independently of g_mutex (which only protects the
                                                 // map itself) so a slow relaunch on one Lister window never
@@ -633,10 +650,12 @@ static int ExtractPageSuffix(std::wstring& path)
 //  hosts Sumatra's reparented window. Resizing it resizes Sumatra to match.
 // ---------------------------------------------------------------------------
 
-// Forward declaration: defined later (near LaunchSumatraEmbedded), called
-// here from WM_HOTKEY -- see RegisterPopOutHotkey for why a Win32 hotkey
-// rather than window subclassing is used to reach this from HostWndProc.
+// Forward declarations: defined later in the file, called here from
+// WM_HOTKEY and WM_SUMATRA_PROCESS_EXITED respectively.
 static void LaunchSumatraStandalone(const ListerInstance* inst);
+static bool TryFallbackShellOpen(const std::wstring& filePath);
+static LRESULT CALLBACK ErrorWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
+static void UnregisterCrashDetection(ListerInstance* inst); // defined just above LaunchSumatraEmbedded
 
 static LRESULT CALLBACK HostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
@@ -675,6 +694,32 @@ static LRESULT CALLBACK HostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                 std::lock_guard<std::mutex> opLock(inst->opLock);
                 if (!inst->closed)
                     LaunchSumatraStandalone(inst.get());
+            }
+            return 0;
+        }
+        case WM_SUMATRA_PROCESS_EXITED: {
+            // Posted by ProcessExitCallback when an embedded Sumatra
+            // process exits on its own. processWaitHandle being still set
+            // is the staleness guard described at RegisterCrashDetection/
+            // UnregisterCrashDetection above -- if it's already null, our
+            // own intentional close got there first and this notification
+            // is obsolete.
+            ListerInstancePtr inst = FindInstance(hwnd);
+            if (inst) {
+                std::lock_guard<std::mutex> opLock(inst->opLock);
+                if (!inst->closed && inst->processWaitHandle && inst->pi.hProcess) {
+                    LogF(L"Detected unexpected Sumatra process exit for %s", inst->filePath.c_str());
+                    inst->processWaitHandle = nullptr; // already fired; nothing left to unregister
+                    CloseHandle(inst->pi.hThread);
+                    CloseHandle(inst->pi.hProcess);
+                    inst->pi = {};
+                    inst->sumatraWnd = nullptr;
+
+                    bool opened = TryFallbackShellOpen(inst->filePath);
+                    SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)ErrorWndProc);
+                    SetWindowLongPtrW(hwnd, GWLP_USERDATA, opened ? ERRSTATE_OPENED_EXTERNAL : ERRSTATE_CRASHED);
+                    InvalidateRect(hwnd, nullptr, TRUE);
+                }
             }
             return 0;
         }
@@ -730,6 +775,67 @@ static HWND WaitForSumatraChild(HWND hostWnd, HANDLE hProcess, DWORD processId, 
         if (pollIntervalMs < 50) pollIntervalMs = std::min(pollIntervalMs + 10, 50ul); // hard-cap at 50ms
     }
     return found;
+}
+
+// ---------------------------------------------------------------------------
+//  Crash detection: notice when an embedded Sumatra process exits on its
+//  own (crash, killed externally, internal error) rather than via our own
+//  intentional close, and show an accurate message instead of leaving a
+//  dead, unresponsive blank pane.
+//
+//  Uses RegisterWaitForSingleObject (a thread-pool wait, not polling) on
+//  the process handle. The callback runs on an arbitrary thread-pool thread
+//  and must do minimal, thread-safe work only -- it just posts a message
+//  back to the host window, which does the real handling on the UI thread.
+//
+//  Race safety: CloseRunningSumatraProcess (our own intentional-close path)
+//  always calls UnregisterWaitEx BEFORE taking any action that could cause
+//  the process to actually exit (WM_CLOSE / TerminateProcess). Since
+//  UnregisterWaitEx cancels the registration and blocks until any
+//  in-progress callback finishes, and the process handle cannot yet be
+//  signaled at that point (we haven't asked it to close yet), an
+//  intentional close can never itself trigger this notification. The
+//  WM_SUMATRA_PROCESS_EXITED handler additionally checks that
+//  processWaitHandle is still set before acting, as a defense-in-depth
+//  guard against any notification that outlives its instance.
+// ---------------------------------------------------------------------------
+
+static void CALLBACK ProcessExitCallback(void* lpParameter, BOOLEAN /*timedOut*/)
+{
+    // Minimal work only: this runs on an OS thread-pool thread, not ours.
+    // PostMessageW is documented safe to call from any thread.
+    HWND hostWnd = (HWND)lpParameter;
+    PostMessageW(hostWnd, WM_SUMATRA_PROCESS_EXITED, 0, 0);
+}
+
+// Registers crash detection for inst's currently-running process. Must be
+// called with inst->opLock held, right after a successful embed.
+static void RegisterCrashDetection(ListerInstance* inst)
+{
+    if (!inst->pi.hProcess || inst->processWaitHandle)
+        return; // nothing to watch, or already watching
+
+    if (!RegisterWaitForSingleObject(&inst->processWaitHandle, inst->pi.hProcess,
+                                      ProcessExitCallback, (void*)inst->hostWnd,
+                                      INFINITE, WT_EXECUTEONLYONCE)) {
+        LogF(L"RegisterWaitForSingleObject failed, error %lu (crash detection unavailable for this instance)",
+             GetLastError());
+        inst->processWaitHandle = nullptr;
+    }
+}
+
+// Cancels crash detection. Must be called with inst->opLock held, and
+// BEFORE any action that could cause inst->pi.hProcess to actually exit --
+// see the race-safety note above.
+static void UnregisterCrashDetection(ListerInstance* inst)
+{
+    if (inst->processWaitHandle) {
+        // INVALID_HANDLE_VALUE here means "block until any in-progress
+        // callback completes," not "pass an invalid handle" -- this is the
+        // documented Win32 idiom for a synchronous, race-free unregister.
+        UnregisterWaitEx(inst->processWaitHandle, INVALID_HANDLE_VALUE);
+        inst->processWaitHandle = nullptr;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -948,6 +1054,7 @@ static bool LaunchSumatraEmbedded(ListerInstance* inst)
 
     inst->sumatraWnd = child;
     RegisterPopOutHotkey(inst);
+    RegisterCrashDetection(inst);
 
     RECT rc; GetClientRect(inst->hostWnd, &rc);
     MoveWindow(child, 0, 0, rc.right - rc.left, rc.bottom - rc.top, TRUE);
@@ -964,6 +1071,10 @@ static void CloseRunningSumatraProcess(ListerInstance* inst, DWORD graceMs = 120
 {
     if (!inst->pi.hProcess)
         return;
+
+    // Must happen before WM_CLOSE/TerminateProcess below -- see the
+    // race-safety note at RegisterCrashDetection/UnregisterCrashDetection.
+    UnregisterCrashDetection(inst);
 
     if (inst->sumatraWnd && IsWindow(inst->sumatraWnd))
         PostMessageW(inst->sumatraWnd, WM_CLOSE, 0, 0);
@@ -1015,6 +1126,10 @@ static bool TryFallbackShellOpen(const std::wstring& filePath)
 
 // hwnd's GWLP_USERDATA doubles as a flag: 1 once a fallback shell-open
 // actually succeeded for this pane, so WM_PAINT can show the right message.
+// GWLP_USERDATA values for ErrorWndProc, set alongside the WNDPROC swap at
+// each call site (defined near the top of this file, alongside the other
+// message/state constants).
+
 static LRESULT CALLBACK ErrorWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     if (msg == WM_PAINT) {
@@ -1024,15 +1139,20 @@ static LRESULT CALLBACK ErrorWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         FillRect(dc, &rc, (HBRUSH)(COLOR_WINDOW + 1));
         SetBkMode(dc, TRANSPARENT);
 
-        bool openedExternally = GetWindowLongPtrW(hwnd, GWLP_USERDATA) != 0;
-        const wchar_t* msg1 = openedExternally
-            ? L"SumatraPDF could not be embedded here, so the file was opened in its default application instead."
-            : L"SumatraPDF could not be found or started.";
-        const wchar_t* msg2 = openedExternally
-            ? L"Install SumatraPDF from https://www.sumatrapdfreader.org/ for an embedded preview here."
-            : L"Install it from https://www.sumatrapdfreader.org/ "
-              L"or place SumatraPDF.exe next to this plugin. "
-              L"Enable DebugLog=1 in SumatraLister.ini for details.";
+        LONG_PTR state = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+        const wchar_t* msg1 = L"SumatraPDF could not be found or started.";
+        const wchar_t* msg2 = L"Install it from https://www.sumatrapdfreader.org/ "
+                               L"or place SumatraPDF.exe next to this plugin. "
+                               L"Enable DebugLog=1 in SumatraLister.ini for details.";
+        if (state == ERRSTATE_OPENED_EXTERNAL) {
+            msg1 = L"SumatraPDF could not be embedded here, so the file was opened in its default application instead.";
+            msg2 = L"Install SumatraPDF from https://www.sumatrapdfreader.org/ for an embedded preview here.";
+        } else if (state == ERRSTATE_CRASHED) {
+            msg1 = L"SumatraPDF closed unexpectedly while viewing this file.";
+            msg2 = L"This usually means the file is corrupted or triggered a rendering "
+                   L"issue in SumatraPDF itself. Try a different file, or re-open this "
+                   L"one to try again. Enable DebugLog=1 in SumatraLister.ini for details.";
+        }
 
         InflateRect(&rc, -10, -10);
         DrawTextW(dc, msg1, -1, &rc, DT_TOP | DT_LEFT | DT_WORDBREAK);
@@ -1408,7 +1528,7 @@ static HWND DoListLoad(HWND ParentWin, const std::wstring& fileName)
     if (!LaunchSumatraEmbedded(inst.get())) {
         bool opened = TryFallbackShellOpen(fileName);
         SetWindowLongPtrW(host, GWLP_WNDPROC, (LONG_PTR)ErrorWndProc);
-        SetWindowLongPtrW(host, GWLP_USERDATA, opened ? 1 : 0);
+        SetWindowLongPtrW(host, GWLP_USERDATA, opened ? ERRSTATE_OPENED_EXTERNAL : ERRSTATE_NOT_FOUND);
         InvalidateRect(host, nullptr, TRUE);
     }
 
@@ -1456,7 +1576,7 @@ __declspec(dllexport) int __stdcall ListLoadNextW(HWND /*ParentWin*/, HWND ListW
     if (!LaunchSumatraEmbedded(inst.get())) {
         bool opened = TryFallbackShellOpen(inst->filePath);
         SetWindowLongPtrW(inst->hostWnd, GWLP_WNDPROC, (LONG_PTR)ErrorWndProc);
-        SetWindowLongPtrW(inst->hostWnd, GWLP_USERDATA, opened ? 1 : 0);
+        SetWindowLongPtrW(inst->hostWnd, GWLP_USERDATA, opened ? ERRSTATE_OPENED_EXTERNAL : ERRSTATE_NOT_FOUND);
         InvalidateRect(inst->hostWnd, nullptr, TRUE);
         return LISTPLUGIN_ERROR;
     }
@@ -1530,7 +1650,7 @@ static bool RelaunchSumatra(ListerInstance* inst)
 
     bool opened = TryFallbackShellOpen(inst->filePath);
     SetWindowLongPtrW(inst->hostWnd, GWLP_WNDPROC, (LONG_PTR)ErrorWndProc);
-    SetWindowLongPtrW(inst->hostWnd, GWLP_USERDATA, opened ? 1 : 0);
+    SetWindowLongPtrW(inst->hostWnd, GWLP_USERDATA, opened ? ERRSTATE_OPENED_EXTERNAL : ERRSTATE_NOT_FOUND);
     InvalidateRect(inst->hostWnd, nullptr, TRUE);
     return false;
 }

@@ -113,6 +113,13 @@ each site in the source for specifics.
 - **Quick View Panel integration**: notifies Total Commander
   (`WM_COMMAND`/`ITM_FOCUS`) when the embedded pane gains focus, so the
   Quick View Panel (Ctrl+Q) highlights its header correctly.
+- **Crash detection**: if an embedded Sumatra process exits unexpectedly —
+  crashed, killed externally, an internal Sumatra error — the pane switches
+  to a clear "closed unexpectedly" message (and, if `FallbackToShellOpen=1`,
+  tries opening the file in its default handler) instead of staying a dead,
+  unresponsive blank window. Uses a Windows thread-pool wait on the process
+  handle (`RegisterWaitForSingleObject`), so detection is immediate and
+  doesn't poll.
 - **Pop-out to full Sumatra** (`EnablePopOut=1`, off by default): registers
   Ctrl+Alt+O to reopen the current file in a normal, full SumatraPDF window
   with its menu/toolbar, for anything the embedded view doesn't expose
@@ -295,6 +302,17 @@ PDF, CHM, DJVU, EPUB, FB2, FB2Z, MOBI, PRC, XPS, OXPS, CB7, CBR, CBT, CBZ
   else has stolen focus at the exact moment a search is triggered. Page
   navigation and zoom don't need this at all: they reach Sumatra directly
   through normal keyboard input once its window has focus.
+- Crash detection (`RegisterWaitForSingleObject` on the embedded process
+  handle) degrades gracefully if registration itself fails, which the
+  Windows documentation allows for but doesn't specify a concrete cause for
+  in practice — the pane simply behaves as it did before this feature
+  existed (an unexpected exit would leave a blank, unresponsive pane until
+  the user navigates away) rather than erroring out. This is logged when
+  `DebugLog=1`. The detection is intentionally ordered so that this
+  plugin's own intentional closes (navigating to the next file, relaunching
+  for a page jump or theme change, closing the Lister window) can never be
+  mistaken for a crash — see the comment block above `ProcessExitCallback`
+  in the source for the exact reasoning.
 - `LCS_MATCHCASE`/`LCS_WHOLEWORDS` (case-sensitive / whole-word search
   flags from `ListSearchText`) are not translated into Sumatra's find bar.
   This plugin doesn't have confirmed knowledge of Sumatra's exact find-bar
