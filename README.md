@@ -75,14 +75,29 @@ each site in the source for specifics.
   - launch in sandboxed `-restrict` mode for untrusted files (`RestrictMode=1`)
   - launch in inverted-colour / night reading mode (`NightMode=1`)
   - set a default zoom / view mode (`DefaultZoom=`, `DefaultView=`)
+  - set a page-surround background colour (`BackgroundColor=`)
+  - trim which extensions the plugin claims (`EnabledExtensions=`)
+  - override zoom/view/night-mode per file type, e.g. comics vs. PDFs (an
+    `[EXT]` section such as `[CBZ]`)
   - enable a troubleshooting log, `SumatraLister.log` (`DebugLog=1`)
 
   See `SumatraLister.ini` in this package for the full, commented template —
   copy it next to the `.wlx`/`.wlx64` file and edit as needed.
-- **Deep-link page jumping**: append `#page=N` to the file path passed into
-  `ListLoad`/`ListLoadNext` (e.g. `C:\book.pdf#page=42`) to open directly at
-  page 42. A real file that happens to be named that way on disk always
-  takes precedence over the heuristic.
+- **Deep links**: append parameters to the file path passed into
+  `ListLoad`/`ListLoadNext` after a `#`, e.g. `C:\book.pdf#page=42`. A real
+  file that happens to be named that way on disk always takes precedence
+  over the heuristic. Supported parameters (combine with `&`, e.g.
+  `#page=5&search=foo`):
+  - `page=N` — open at page N
+  - `dest=NAME` — open at a named destination / table-of-contents entry (`-named-dest`)
+  - `search=TERM` — open with TERM already searched and highlighted (`-search`)
+  - `forwardsearch=SOURCE:LINE` — SyncTeX/PdfSync jump from a LaTeX source
+    location, e.g. `#forwardsearch=C%3A%5Csrc%5Cmain.tex:123` (`-forward-search`)
+  - `pwd=PASSWORD` — open a password-protected file (`-pwd`); only ever read
+    from a link supplied like this, never stored anywhere by this plugin
+  - Values are percent-decoded (`%20` → space). `page`/`dest`/`forwardsearch`
+    are mutually exclusive "where to open" commands; `search`/`pwd` combine
+    with any of them.
 - **Find / Copy / Select All / scroll-to-percent**: the real
   `ListSendCommand` set (`LC_COPY`, `LC_SELECTALL`, `LC_SETPERCENT`) and
   `ListSearchText[W]`/`ListSearchDialog` (honoring the real
@@ -101,10 +116,16 @@ each site in the source for specifics.
   `ThumbnailsEnabled=` in the INI.
 - **Printing**: implements `ListPrint[W]`. When the file being printed is
   already open in a live embedded pane, shows Sumatra's own native print
-  dialog (full printer/page-range/copies control) via Ctrl+P; otherwise
-  falls back to Sumatra's non-interactive command-line printing
-  (`-print-to[-default]`), optionally with `-print-settings` from the INI
-  (`PrintSettings=`, e.g. `fit`, `duplex`, `landscape`).
+  dialog (full printer/page-range/copies control) via Ctrl+P. Otherwise
+  (the less common case — no live pane to reuse), `InteractivePrintFallback=`
+  decides what happens: by default (`1`), it still shows Sumatra's own
+  interactive print dialog (`-print-dialog -exit-when-done`) and returns
+  immediately rather than waiting for you to finish with it; set it to `0`
+  for the old silent, non-interactive behaviour (`-print-to[-default]
+  -silent`, briefly blocking until the job finishes) if you need
+  scripted/automated printing that can't have a dialog pop up unattended.
+  Either mode honours `PrintSettings=` from the INI (e.g. `fit`, `duplex`,
+  `landscape`).
 - **Auto night mode**: with `AutoNightMode=1`, the plugin reads Total
   Commander's real dark-mode notification (`LC_NEWPARAMS` with the
   `LCP_DARKMODE`/`LCP_DARKMODENATIVE` flags) and relaunches Sumatra
@@ -126,6 +147,11 @@ each site in the source for specifics.
   (Save As, annotating, rotating, bookmarks). Off by default because the
   hotkey is active system-wide for as long as any Lister pane using this
   plugin is open, not just while that pane has focus — see Limitations.
+- **Diagnostic snapshot** (`EnableDiagnosticHotkey=1`, off by default, same
+  system-wide scoping caveat as pop-out): Ctrl+Alt+D copies plugin version,
+  detected Sumatra path, effective settings, and a recent log tail (if
+  `DebugLog=1`) to the clipboard — handy for pasting into a bug report.
+  Never includes a deep link's `pwd`/`search` value.
 - **Fallback to default app** (`FallbackToShellOpen=1`): if Sumatra can't be
   found or fails to embed, opens the file with its default Windows handler
   in a separate window instead of just showing an error message.
@@ -181,6 +207,33 @@ each fix site in the source):
 - Registry-view probing during Sumatra detection tried 3 `KEY_WOW64_*`
   variations per key when at most 2 are ever meaningfully different for a
   given build — the third was always a wasted duplicate.
+- The diagnostic-snapshot hotkey (Ctrl+Alt+D) showed its confirmation
+  message box while still holding the same per-pane lock every other
+  operation on that pane needs — closing the pane, navigating to the next
+  file, a find/copy command, even pressing the hotkey again would all have
+  blocked for however long the user left that confirmation dialog open,
+  since it's a modal call with no bound on how long that takes. Fixed by
+  moving the message box outside the lock, keeping only the actual
+  data-gathering (which does need it) protected.
+- `CMakeLists.txt` was missing `ole32` and `gdi32` from its linked
+  libraries, even though the source genuinely uses both (COM for the
+  thumbnail feature, GDI for the error pane's rendering) — every one of
+  this project's own MinGW verification builds throughout development
+  explicitly included `-lole32 -lgdi32`, but the CMakeLists.txt itself was
+  never updated to match. In practice this gap turned out to be masked for
+  most real build paths: MinGW-w64's own linker driver automatically
+  appends a standard set of Windows default libraries (including both of
+  these) to every DLL link regardless of what's explicitly requested, and
+  a CMake-generated Visual Studio project file typically inherits a
+  similar default library list from VS's own project template — which is
+  almost certainly why an actual MSVC build got as far as a `LNK4070`
+  warning rather than failing outright. It's still a real correctness gap
+  worth fixing, though: a CMake generator that doesn't go through a
+  `.vcxproj` (e.g. Ninja or NMake makefiles targeting the MSVC toolset
+  directly) has no such safety net, and a `CMakeLists.txt` shouldn't rely
+  on another tool's implicit default-library behavior to begin with. Fixed
+  by adding both explicitly; verified with a real CMake-driven MinGW build
+  (configure + compile + link, not just a manual compiler invocation).
 
 ## How it works
 
@@ -369,14 +422,18 @@ PDF, CHM, DJVU, EPUB, FB2, FB2Z, MOBI, PRC, XPS, OXPS, CB7, CBR, CBT, CBZ
   formats; PDF also has a built-in Windows handler on modern versions). If a
   given extension has no handler registered, `ListGetPreviewBitmap` simply
   returns no bitmap and TC falls back to its default icon — it won't crash.
-- `ListPrint` waits for Sumatra's print job to finish and exit before
-  returning, up to a 60-second timeout; very large documents on a slow
-  printer could exceed it, in which case the plugin now reports failure and
-  terminates the still-running Sumatra process rather than leaving it
-  orphaned. This wait happens on whichever thread Total Commander calls
-  `ListPrint` on. This CLI-print path is only used as a fallback now — when
-  the file being printed is already open in a live embedded pane, Ctrl+P
-  opens Sumatra's own print dialog instead (see Features).
+- `ListPrint`'s fallback path (no live pane to reuse) defaults to showing
+  Sumatra's own interactive print dialog and returning immediately
+  (`InteractivePrintFallback=1`) — see Features. The old 60-second-timeout,
+  wait-for-completion behavior only applies in the legacy silent mode
+  (`InteractivePrintFallback=0`); very large documents on a slow printer
+  could still exceed that timeout in that mode, in which case the plugin
+  reports failure and terminates the still-running Sumatra process rather
+  than leaving it orphaned. This wait happens on whichever thread Total
+  Commander calls `ListPrint` on. The interactive mode is deliberately
+  fire-and-forget instead of also waiting, since blocking on arbitrary,
+  user-paced dialog interaction would make Total Commander's own UI appear
+  frozen for however long that takes.
 - `ListPrint` does not forward custom print margins from Total Commander
   (the `Margins` parameter, a `RECT*` in units of MM_LOMETRIC — tenths of a
   millimeter — per the SDK docs). Sumatra manages its own print margins via
@@ -385,3 +442,27 @@ PDF, CHM, DJVU, EPUB, FB2, FB2Z, MOBI, PRC, XPS, OXPS, CB7, CBR, CBT, CBZ
   without live cross-version testing risked silently wrong (clipped) output
   — worse than the current, explicit no-op. Use `PrintSettings=` in the INI
   if you need specific margins.
+- The `forwardsearch=` deep-link parameter's exact argument shape to
+  Sumatra's `-forward-search` switch has one point of genuine ambiguity:
+  Sumatra's own documentation shows this switch both with and without an
+  explicit third `<pdfpath>` argument (the other two being the source file
+  and line number) in different examples. This plugin always supplies the
+  PDF via the ordinary trailing file argument — the same convention
+  `-page`/`-zoom`/`-view` already rely on here — and does not pass a third
+  argument to `-forward-search` itself. This is expected to work based on
+  that convention, but hasn't been confirmed against a real forward-search
+  workflow; if it doesn't work as expected for you, that argument shape is
+  the first thing to check with `SumatraPDF.exe -h` against your version.
+- Deep-link values (destination names, search terms, LaTeX source paths,
+  passwords) go through a properly-escaping command-line quoting routine
+  (matching `CommandLineToArgvW`'s parsing rules) rather than naive
+  `"value"` wrapping, since these are more free-form than the strictly
+  digit-validated page numbers the original `#page=N` link used — an
+  unescaped embedded quote could otherwise break out of its argument and
+  inject additional command-line arguments. Verified with a set of
+  known-tricky round-trip tests (embedded quotes, trailing backslashes,
+  an explicit injection attempt) during development, not just reasoned
+  through.
+- `EnableDiagnosticHotkey`'s Ctrl+Alt+D has the same system-wide scoping
+  caveat as `EnablePopOut`'s Ctrl+Alt+O — see the note on that above. Both
+  default to off for the same reason and can be enabled independently.

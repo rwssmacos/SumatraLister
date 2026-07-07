@@ -4,4 +4,4 @@ descriptionrus=SumatraLister to view PDF, CHM, DjVu, EPUB, FB2, MOBI, PRC, OpenX
 type=wlx
 file=SumatraLister.wlx
 defaultdir=Plugins\wlx\SumatraLister
-version=2.3
+version=2.5

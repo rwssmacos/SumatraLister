@@ -25,12 +25,17 @@
 //   - Auto-detects SumatraPDF (registry / common paths / PATH), with an
 //     optional manual override via SumatraLister.ini.
 //   - INI-configurable launch options: default zoom, default view mode,
-//     night/inverted-colour mode, restricted (sandboxed) mode, embed timeout,
-//     and free-form extra command-line arguments.
-//   - Deep-link page jumping: append "#page=N" to the path passed to
-//     ListLoad/ListLoadNext (e.g. by another plugin or a custom TC command)
-//     to open directly at page N. A real file that happens to be named that
-//     way on disk always takes precedence over the heuristic.
+//     page-surround background colour, night/inverted-colour mode,
+//     restricted (sandboxed) mode, embed timeout, an EnabledExtensions
+//     allowlist, per-[EXT]-section overrides (e.g. different defaults for
+//     comics vs. PDFs), and free-form extra command-line arguments.
+//   - Deep links: append parameters after a "#" in the path passed to
+//     ListLoad/ListLoadNext, e.g. "C:\book.pdf#page=5&search=foo". Supports
+//     page=N, dest=NAME (named destination / TOC entry), search=TERM,
+//     forwardsearch=SOURCE:LINE (SyncTeX/PdfSync), and pwd=PASSWORD
+//     (never persisted, only ever read from a link supplied this way). A
+//     real file that happens to be named like a deep link on disk always
+//     takes precedence over the heuristic.
 //   - Implements the real ListSendCommand set (LC_COPY, LC_NEWPARAMS,
 //     LC_SELECTALL, LC_SETPERCENT), ListSearchText[W] with its real
 //     LCS_FINDFIRST/LCS_MATCHCASE/LCS_WHOLEWORDS/LCS_BACKWARDS flags, and
@@ -41,9 +46,12 @@
 //   - File-list thumbnails (ListGetPreviewBitmap[W]) via the Windows Shell
 //     thumbnail pipeline -- no extra Sumatra process spawned per thumbnail.
 //   - Printing (ListPrint[W]): shows Sumatra's own native print dialog when
-//     reusing a live embedded pane for the file being printed, falling back
-//     to non-interactive CLI printing (-print-to/-print-to-default)
-//     otherwise.
+//     reusing a live embedded pane for the file being printed. The (less
+//     common) fallback case defaults to also showing an interactive print
+//     dialog (InteractivePrintFallback=1), returning immediately rather
+//     than blocking on user-paced dialog interaction; can be switched to
+//     the old silent, wait-for-completion CLI behavior for scripted/
+//     automated printing (InteractivePrintFallback=0).
 //   - Auto night mode: with AutoNightMode=1, follows Total Commander's own
 //     Lister dark-mode state (via the real LC_NEWPARAMS/LCP_DARKMODE
 //     mechanism) instead of a fixed setting.
@@ -58,6 +66,10 @@
 //     reopens the current file in a normal, full SumatraPDF window with its
 //     menu/toolbar, for actions the embedded view doesn't expose (Save As,
 //     annotate, rotate...).
+//   - Optional diagnostic-snapshot hotkey (EnableDiagnosticHotkey=1, off by
+//     default): Ctrl+Alt+D copies plugin version, detected Sumatra path,
+//     effective config, and a recent log tail to the clipboard for bug
+//     reports. Never includes a deep link's pwd/search value.
 //   - Optional fallback (FallbackToShellOpen=1): if Sumatra can't be found
 //     or embedded, opens the file with its default Windows handler instead
 //     of just showing an error message.
@@ -112,6 +124,8 @@
 #include <memory>
 #include <algorithm>     // std::min / std::max
 #include <cstdint>       // std::uint8_t
+#include <utility>       // std::pair
+#include <cwctype>       // iswxdigit
 #include <cstdio>
 #include <cstdarg>
 
@@ -131,8 +145,6 @@
 //  real API; see README.md's "API correctness" section for what changed
 //  and why.
 // ---------------------------------------------------------------------------
-
-#define LISTPLUGIN_VERSION 0x1A0
 
 // ListSendCommand commands (TC calls this "when the user changes some
 // options in Lister's menu" -- these four are the complete, real set).
@@ -172,6 +184,12 @@
 // highlights correctly.
 #define ITM_FOCUS 0xFFF8
 
+// Plugin's own version, independent of SumatraPDF's version. Bump when
+// making a user-visible change; surfaced in the diagnostic snapshot
+// (Ctrl+Alt+D, if EnableDiagnosticHotkey=1) to make bug reports easier to
+// place in context.
+#define PLUGIN_VERSION L"1.0"
+
 // Custom message (private to this plugin, not part of the WLX API): posted
 // to a host window by ProcessExitCallback when its embedded Sumatra process
 // exits. See RegisterCrashDetection.
@@ -197,6 +215,17 @@ struct ListDefaultParamStruct {
     char  DefaultIniName[MAX_PATH];
 };
 
+// Canonical list of extensions this plugin knows how to handle (matches
+// what SumatraPDF itself can open). Used to build ListGetDetectString's
+// detection string (filtered by EnabledExtensions if set) and to look for
+// per-extension INI override sections ([PDF], [CBZ], etc.) in
+// LoadConfigImpl -- kept as one shared list so those two things can't
+// silently drift out of sync with each other.
+static const wchar_t* const kSupportedExtensions[] = {
+    L"PDF", L"CHM", L"DJVU", L"EPUB", L"FB2", L"FB2Z", L"MOBI", L"PRC",
+    L"XPS", L"OXPS", L"CB7", L"CBR", L"CBT", L"CBZ"
+};
+
 // ---------------------------------------------------------------------------
 //  Config (SumatraLister.ini, same folder as the DLL)
 // ---------------------------------------------------------------------------
@@ -209,7 +238,28 @@ struct ListDefaultParamStruct {
 //  AutoNightMode=0                                   ; 1 = follow TC's Lister light/dark theme instead
 //  DefaultZoom=                                      ; e.g. "fit page", "100", "fit width"
 //  DefaultView=                                      ; e.g. "continuous", "facing", "book view"
+//  BackgroundColor=                                  ; hex RGB, e.g. "2B2B2B"; forwarded to -bg-color
+//                                                     ;     (the page-surround color, distinct from
+//                                                     ;     NightMode/-invertcolors' page/text inversion)
+//  EnabledExtensions=                                ; comma-separated allowlist, e.g. "PDF,EPUB,CBZ";
+//                                                     ;     empty (default) = every supported extension
+//                                                     ;     stays enabled. Trims what ListGetDetectString
+//                                                     ;     advertises to TC without recompiling.
 //  PrintSettings=                                    ; forwarded to -print-settings for ListPrint
+//  InteractivePrintFallback=1                        ; when ListPrint's fallback path is used (no
+//                                                     ;     live embedded pane open for the file being
+//                                                     ;     printed -- the common case reuses that pane's
+//                                                     ;     own Ctrl+P dialog instead, see Features), this
+//                                                     ;     decides how it behaves: 1 = show Sumatra's own
+//                                                     ;     interactive print dialog (printer/page-range/
+//                                                     ;     copies choice), matching the SDK's documented
+//                                                     ;     expectation; the plugin returns immediately
+//                                                     ;     rather than waiting for the user to finish.
+//                                                     ;     0 = the old silent, non-interactive behavior
+//                                                     ;     (-print-to/-print-to-default), which blocks
+//                                                     ;     briefly waiting for the job to finish -- for
+//                                                     ;     scripted/automated printing workflows that
+//                                                     ;     can't have a dialog popping up unattended.
 //  ThumbnailsEnabled=1                               ; 1 = supply file-list thumbnails via Shell API
 //  EmbedTimeoutMs=4000                               ; how long to wait for Sumatra to embed before giving up
 //  FallbackToShellOpen=0                             ; 1 = open the file with its default Windows app if
@@ -222,8 +272,32 @@ struct ListDefaultParamStruct {
 //                                                     ;     for printing/annotating/saving). OFF by default
 //                                                     ;     since the hotkey isn't scoped to just this pane
 //                                                     ;     having focus -- see README for details.
+//  EnableDiagnosticHotkey=0                           ; 1 = register Ctrl+Alt+D as a system-wide hotkey
+//                                                     ;     (same scoping caveat as EnablePopOut) that
+//                                                     ;     copies a diagnostic snapshot (plugin version,
+//                                                     ;     detected Sumatra path, effective config, recent
+//                                                     ;     log lines) to the clipboard, for faster bug
+//                                                     ;     reports. Never includes DeepLinkParams.pwd or
+//                                                     ;     .search values. OFF by default, same reasoning
+//                                                     ;     as EnablePopOut.
 //  DebugLog=0                                        ; 1 = write SumatraLister.log next to DLL
 //
+//  Per-extension overrides: an optional [EXT] section (e.g. [CBZ], [EPUB])
+//  overrides DefaultZoom/DefaultView/NightMode from [Settings] for files of
+//  that extension only. Useful since comics/ebooks often want different
+//  defaults than PDFs (e.g. continuous/fit-width for comics, fit-page for
+//  PDFs). Any key not present in the [EXT] section falls back to the
+//  [Settings] value. Example:
+//    [CBZ]
+//    DefaultView=continuous
+//    DefaultZoom=fit width
+//
+struct PerExtensionOverrides {
+    std::wstring defaultZoom;    // empty = not overridden, use [Settings]
+    std::wstring defaultView;    // empty = not overridden, use [Settings]
+    int          nightMode = -1; // -1 = not overridden, 0 = off, 1 = on
+};
+
 struct PluginConfig {
     std::wstring sumatraPathOverride;
     std::wstring extraArgs;
@@ -232,12 +306,17 @@ struct PluginConfig {
     bool         autoNightMode       = false;
     std::wstring defaultZoom;
     std::wstring defaultView;
+    std::wstring backgroundColor;
+    std::wstring enabledExtensions;  // empty = all; else comma-separated allowlist
     std::wstring printSettings;
+    bool         interactivePrintFallback = true;
     bool         thumbnailsEnabled   = true;
     DWORD        embedTimeoutMs      = 4000;
     bool         fallbackShellOpen   = false;
     bool         enablePopOut        = false;
+    bool         enableDiagnosticHotkey = false;
     bool         debugLog            = false;
+    std::map<std::wstring, PerExtensionOverrides> perExtension; // key: uppercase extension, no dot
 };
 
 static PluginConfig   g_config;
@@ -325,6 +404,55 @@ static void LogF(const wchar_t* fmt, ...)
     }
 }
 
+// Reads roughly the last maxLines lines from the debug log, for the
+// diagnostic snapshot feature (Ctrl+Alt+D). Avoids loading the whole
+// (possibly ~2MB, per LogF's own rotation threshold) file into memory by
+// seeking near the end and reading a bounded trailing chunk instead. The
+// seek offset is a raw byte count while the file is read back through a
+// UTF-8-transcoding text-mode handle, so landing mid-character right at the
+// start of the read is possible in principle -- in practice this content
+// is essentially always plain ASCII (timestamps, paths, function names),
+// so this is treated as an acceptable, cosmetic-at-worst imperfection for
+// a diagnostic convenience feature rather than something worth more
+// complex boundary-aware seeking to fully rule out.
+static std::wstring ReadLogTail(int maxLines)
+{
+    std::wstring path = GetLogPath();
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path.c_str(), L"r, ccs=UTF-8") != 0 || !f)
+        return L"(log file not found -- enable DebugLog=1, reopen the file, and try again)";
+
+    (void)fseek(f, 0, SEEK_END); // best-effort seek; a failure here just means we read from wherever we already were
+    long size = ftell(f);
+    const long kMaxTailBytes = 16 * 1024; // generous for well over maxLines' worth of typical lines
+    long start = (size > kMaxTailBytes) ? size - kMaxTailBytes : 0;
+    (void)fseek(f, start, SEEK_SET); // same: best-effort, falls back to reading from the current position on failure
+
+    std::wstring text;
+    wint_t ch;
+    while ((ch = fgetwc(f)) != WEOF)
+        text += (wchar_t)ch;
+    (void)fclose(f); // best-effort diagnostic read; nothing actionable to do if the close itself fails here
+
+    std::vector<std::wstring> lines;
+    size_t pos = 0;
+    while (pos <= text.size()) {
+        size_t nl = text.find(L'\n', pos);
+        lines.push_back(text.substr(pos, nl == std::wstring::npos ? std::wstring::npos : nl - pos));
+        if (nl == std::wstring::npos) break;
+        pos = nl + 1;
+    }
+
+    size_t firstToKeep = (lines.size() > (size_t)maxLines) ? lines.size() - (size_t)maxLines : 0;
+    std::wstring result;
+    for (size_t i = firstToKeep; i < lines.size(); i++) {
+        if (lines[i].empty()) continue;
+        result += lines[i];
+        result += L"\r\n";
+    }
+    return result.empty() ? L"(log is empty)" : result;
+}
+
 static void LoadConfigImpl()
 {
     std::wstring ini = GetIniPath();
@@ -345,6 +473,7 @@ static void LoadConfigImpl()
     g_config.thumbnailsEnabled = GetPrivateProfileIntW(L"Settings", L"ThumbnailsEnabled", 1, ini.c_str()) != 0;
     g_config.fallbackShellOpen = GetPrivateProfileIntW(L"Settings", L"FallbackToShellOpen", 0, ini.c_str()) != 0;
     g_config.enablePopOut      = GetPrivateProfileIntW(L"Settings", L"EnablePopOut", 0, ini.c_str()) != 0;
+    g_config.enableDiagnosticHotkey = GetPrivateProfileIntW(L"Settings", L"EnableDiagnosticHotkey", 0, ini.c_str()) != 0;
     g_config.debugLog          = GetPrivateProfileIntW(L"Settings", L"DebugLog", 0, ini.c_str()) != 0;
 
     UINT timeoutRaw = GetPrivateProfileIntW(L"Settings", L"EmbedTimeoutMs", 4000, ini.c_str());
@@ -354,7 +483,7 @@ static void LoadConfigImpl()
     // return a huge UINT (e.g. "-1" -> UINT_MAX), and converting that to int
     // before clamping would rely on implementation-defined signed/unsigned
     // conversion behavior instead of just clamping the unsigned value directly.
-    g_config.embedTimeoutMs = (timeoutRaw < 500) ? 500 : (timeoutRaw > 30000 ? 30000 : timeoutRaw);
+    g_config.embedTimeoutMs = std::clamp(timeoutRaw, 500u, 30000u);
 
     GetPrivateProfileStringW(L"Settings", L"DefaultZoom", L"", buf, _countof(buf), ini.c_str());
     g_config.defaultZoom = buf;
@@ -362,15 +491,48 @@ static void LoadConfigImpl()
     GetPrivateProfileStringW(L"Settings", L"DefaultView", L"", buf, _countof(buf), ini.c_str());
     g_config.defaultView = buf;
 
+    GetPrivateProfileStringW(L"Settings", L"BackgroundColor", L"", buf, _countof(buf), ini.c_str());
+    g_config.backgroundColor = buf;
+
+    GetPrivateProfileStringW(L"Settings", L"EnabledExtensions", L"", buf, _countof(buf), ini.c_str());
+    g_config.enabledExtensions = buf;
+
     GetPrivateProfileStringW(L"Settings", L"PrintSettings", L"", buf, _countof(buf), ini.c_str());
     g_config.printSettings = buf;
 
+    g_config.interactivePrintFallback = GetPrivateProfileIntW(L"Settings", L"InteractivePrintFallback", 1, ini.c_str()) != 0;
+
+    // Per-extension [EXT] override sections. A nonexistent section reads
+    // back identically to an empty key, so there's no need to separately
+    // check for the section's existence -- just try each expected key.
+    g_config.perExtension.clear();
+    for (const wchar_t* ext : kSupportedExtensions) {
+        PerExtensionOverrides ov;
+        bool any = false;
+
+        GetPrivateProfileStringW(ext, L"DefaultZoom", L"", buf, _countof(buf), ini.c_str());
+        if (buf[0]) { ov.defaultZoom = buf; any = true; }
+
+        GetPrivateProfileStringW(ext, L"DefaultView", L"", buf, _countof(buf), ini.c_str());
+        if (buf[0]) { ov.defaultView = buf; any = true; }
+
+        // Read as a string first (not GetPrivateProfileIntW directly) so
+        // "key absent" (buf stays empty) is distinguishable from "NightMode=0"
+        // -- matching the -1 = "not overridden" sentinel in PerExtensionOverrides.
+        GetPrivateProfileStringW(ext, L"NightMode", L"", buf, _countof(buf), ini.c_str());
+        if (buf[0]) { ov.nightMode = (_wtoi(buf) != 0) ? 1 : 0; any = true; }
+
+        if (any)
+            g_config.perExtension[ext] = ov;
+    }
+
     LogF(L"Config loaded: override='%s' extra='%s' restrict=%d night=%d auto-night=%d "
-         L"zoom='%s' view='%s' timeout=%lu fallback=%d",
+         L"zoom='%s' view='%s' bgcolor='%s' enabled-ext='%s' timeout=%lu fallback=%d per-ext-overrides=%zu",
          g_config.sumatraPathOverride.c_str(), g_config.extraArgs.c_str(),
          g_config.restrictMode, g_config.nightMode, g_config.autoNightMode,
          g_config.defaultZoom.c_str(), g_config.defaultView.c_str(),
-         g_config.embedTimeoutMs, g_config.fallbackShellOpen);
+         g_config.backgroundColor.c_str(), g_config.enabledExtensions.c_str(),
+         g_config.embedTimeoutMs, g_config.fallbackShellOpen, g_config.perExtension.size());
 }
 
 // Thread-safe lazy config load: exactly one caller (whichever thread gets
@@ -380,6 +542,92 @@ static void LoadConfigImpl()
 static void LoadConfig()
 {
     std::call_once(g_configOnceFlag, LoadConfigImpl);
+}
+
+// Returns path's extension with no leading dot, uppercased (e.g. "PDF"), or
+// an empty string if it has none. Used for per-extension INI overrides and
+// EnabledExtensions filtering.
+static std::wstring GetExtensionUpper(const std::wstring& path)
+{
+    const wchar_t* ext = PathFindExtensionW(path.c_str());
+    if (!ext || !*ext)
+        return std::wstring();
+    std::wstring result = ext + 1; // skip the leading '.'
+    for (wchar_t& c : result)
+        c = (wchar_t)towupper(c);
+    return result;
+}
+
+static const PerExtensionOverrides* FindExtensionOverrides(const std::wstring& filePath)
+{
+    std::wstring ext = GetExtensionUpper(filePath);
+    if (ext.empty())
+        return nullptr;
+    auto it = g_config.perExtension.find(ext);
+    return (it != g_config.perExtension.end()) ? &it->second : nullptr;
+}
+
+// Effective zoom/view given an already-looked-up override (or nullptr if
+// none applies): the override's value if it set one, else the [Settings]
+// default. Take the override pointer directly, rather than a filePath to
+// re-derive it from, since both are always needed together for the same
+// file at their one call site (LaunchSumatraEmbedded) -- computing
+// FindExtensionOverrides twice for the same path would be pure redundant
+// work for no benefit.
+static std::wstring GetEffectiveZoom(const PerExtensionOverrides* ov)
+{
+    return (ov && !ov->defaultZoom.empty()) ? ov->defaultZoom : g_config.defaultZoom;
+}
+static std::wstring GetEffectiveView(const PerExtensionOverrides* ov)
+{
+    return (ov && !ov->defaultView.empty()) ? ov->defaultView : g_config.defaultView;
+}
+
+// Effective static night-mode (-invertcolors) for filePath, honoring the
+// documented precedence: AutoNightMode, when on, overrides every static
+// setting (global or per-extension) -- matching NightMode's own existing
+// "ignored if AutoNightMode=1" documented behavior, applied consistently
+// to the per-extension override too. When AutoNightMode is off, a
+// per-extension override wins over the global NightMode= default. Takes a
+// filePath (unlike GetEffectiveZoom/View above) since its one call site
+// doesn't already have an override pointer computed for another reason.
+static bool GetEffectiveStaticNightMode(const std::wstring& filePath)
+{
+    if (g_config.autoNightMode)
+        return false; // AutoNightMode decides later via LC_NEWPARAMS, not here
+    const PerExtensionOverrides* ov = FindExtensionOverrides(filePath);
+    if (ov && ov->nightMode >= 0)
+        return ov->nightMode != 0;
+    return g_config.nightMode;
+}
+
+// Checks `ext` (no dot, e.g. L"PDF") against the comma-separated
+// EnabledExtensions allowlist. An empty allowlist (the default) means
+// everything is enabled, preserving prior behavior exactly. Comparison is
+// case-insensitive; entries may have surrounding whitespace.
+static bool IsExtensionEnabled(const wchar_t* ext)
+{
+    if (g_config.enabledExtensions.empty())
+        return true;
+
+    const std::wstring& list = g_config.enabledExtensions;
+    size_t start = 0;
+    while (start <= list.size()) {
+        size_t comma = list.find(L',', start);
+        std::wstring token = list.substr(start, comma == std::wstring::npos ? std::wstring::npos : comma - start);
+
+        size_t first = token.find_first_not_of(L" \t");
+        size_t last  = token.find_last_not_of(L" \t");
+        if (first != std::wstring::npos) {
+            token = token.substr(first, last - first + 1);
+            if (_wcsicmp(token.c_str(), ext) == 0)
+                return true;
+        }
+
+        if (comma == std::wstring::npos) break;
+        start = comma + 1;
+    }
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -394,7 +642,8 @@ struct ListerInstance {
     std::wstring       filePath;
     bool               currentInvert = false;  // effective -invertcolors state of the running process
     bool               closed        = false;  // true once TeardownInstance has run; guards reuse-after-close
-    int                hotkeyId      = 0;       // RegisterHotKey id for pop-out, 0 = not registered
+    int                popOutHotkeyId = 0;      // RegisterHotKey id for pop-out (Ctrl+Alt+O), 0 = not registered
+    int                diagHotkeyId   = 0;       // RegisterHotKey id for diagnostic snapshot (Ctrl+Alt+D), 0 = not registered
     HANDLE             processWaitHandle = nullptr; // RegisterWaitForSingleObject handle; see ProcessExitCallback
     std::mutex         opLock;                 // serializes launch/relaunch/close for *this* instance,
                                                 // held independently of g_mutex (which only protects the
@@ -615,34 +864,158 @@ static const std::wstring& GetSumatraPath()
 }
 
 // ---------------------------------------------------------------------------
-//  Deep-link page suffix: "C:\book.pdf#page=42" -> path="C:\book.pdf", page=42
+//  Deep links: "C:\book.pdf#page=42" -> path="C:\book.pdf", page=42, etc.
+//
+//  Syntax: one or more "&"-separated "key=value" pairs after the first '#'.
+//  Values are percent-decoded (e.g. "%20" -> space; see UrlDecode).
+//    page=N              -- open at page N (existing, unchanged syntax)
+//    dest=NAME           -- open at a named destination / TOC entry (-named-dest)
+//    search=TERM         -- open with TERM already searched/highlighted (-search)
+//    forwardsearch=SRC:LINE -- SyncTeX/PdfSync jump from a LaTeX source
+//                           location (-forward-search); SRC is matched via
+//                           the LAST ':' with an all-digit tail, so a Windows
+//                           drive letter ("C:") is never misread as the
+//                           separator (it only ever appears at index 1).
+//    pwd=PASSWORD        -- open a password-protected file (-pwd). Only ever
+//                           read from a caller-supplied link like this, not
+//                           persisted anywhere by this plugin.
+//  Examples: "C:\book.pdf#page=5", "C:\book.pdf#dest=Chapter3",
+//  "C:\book.pdf#search=hello%20world", "C:\book.pdf#page=5&search=foo",
+//  "C:\report.pdf#forwardsearch=C%3A%5Csrc%5Cmain.tex:123", "...#pwd=secret"
+//
+//  page/dest/forwardsearch are mutually exclusive "where to open" commands;
+//  search and pwd can combine with any of them. If more than one
+//  positioning command is given, forwardsearch wins, then dest, then page
+//  (logged if DebugLog=1) rather than silently picking one with no record
+//  of the conflict.
 // ---------------------------------------------------------------------------
 
-static int ExtractPageSuffix(std::wstring& path)
+struct DeepLinkParams {
+    int          page             = -1;  // -page N
+    std::wstring dest;                   // -named-dest <name>
+    std::wstring search;                 // -search <term>
+    std::wstring forwardSearchFile;      // -forward-search <sourcepath> <line>
+    int          forwardSearchLine  = -1;
+    std::wstring pwd;                    // -pwd <password>
+
+    bool HasPositionCommand() const { return page > 0 || !dest.empty() || forwardSearchLine > 0; }
+};
+
+// Minimal percent-decoding for deep-link values (e.g. "%20" -> ' '),
+// following the standard URL query-string convention ('+' -> ' ' too).
+// Malformed sequences (a '%' not followed by exactly two hex digits) are
+// left as-is rather than treated as an error, since a value with a literal
+// '%' in it (e.g. a search term) should still work on a best-effort basis.
+static std::wstring UrlDecode(const std::wstring& in)
 {
+    std::wstring out;
+    out.reserve(in.size());
+    for (size_t i = 0; i < in.size(); i++) {
+        if (in[i] == L'%' && i + 2 < in.size() && iswxdigit(in[i + 1]) && iswxdigit(in[i + 2])) {
+            wchar_t hex[3] = { in[i + 1], in[i + 2], 0 };
+            out += (wchar_t)wcstol(hex, nullptr, 16);
+            i += 2;
+        } else if (in[i] == L'+') {
+            out += L' ';
+        } else {
+            out += in[i];
+        }
+    }
+    return out;
+}
+
+static DeepLinkParams ExtractDeepLinkParams(std::wstring& path)
+{
+    DeepLinkParams result;
+
     // If a literal file already exists at this exact path -- including any
-    // "#page=N"-looking tail -- trust the filesystem over the heuristic.
-    // This is what keeps a real file legitimately named e.g.
-    // "Report#page=2.pdf" from being silently misread as a page-42 deep
-    // link and opened under the wrong (non-existent) trimmed path.
+    // "#..."-looking tail -- trust the filesystem over the heuristic. This
+    // is what keeps a real file legitimately named e.g. "Report#draft.pdf"
+    // from being silently misread as a deep link and opened under the
+    // wrong (non-existent) trimmed path.
     if (FileExistsW(path))
-        return -1;
+        return result;
 
-    const std::wstring marker = L"#page=";
-    size_t pos = path.rfind(marker);
-    if (pos == std::wstring::npos)
-        return -1;
+    size_t hashPos = path.find(L'#');
+    if (hashPos == std::wstring::npos)
+        return result;
 
-    std::wstring numPart = path.substr(pos + marker.size());
-    if (numPart.empty() || numPart.find_first_not_of(L"0123456789") != std::wstring::npos)
-        return -1; // not a clean number, leave the path alone
+    std::wstring suffix = path.substr(hashPos + 1);
+    std::wstring base   = path.substr(0, hashPos);
 
-    int page = _wtoi(numPart.c_str());
-    if (page <= 0)
-        return -1;
+    bool sawRecognizedKey = false;
+    bool haveForwardSearch = false, haveDest = false, havePage = false;
 
-    path.resize(pos); // truncate to the prefix before "#page=N"; equivalent to path.substr(0,pos) without the temporary
-    return page;
+    size_t start = 0;
+    while (start <= suffix.size()) {
+        size_t amp = suffix.find(L'&', start);
+        std::wstring token = suffix.substr(start, amp == std::wstring::npos ? std::wstring::npos : amp - start);
+        size_t eq = token.find(L'=');
+
+        if (eq != std::wstring::npos) {
+            std::wstring key = token.substr(0, eq);
+            std::wstring val = UrlDecode(token.substr(eq + 1));
+
+            if (key == L"page") {
+                if (!val.empty() && val.find_first_not_of(L"0123456789") == std::wstring::npos) {
+                    int p = _wtoi(val.c_str());
+                    if (p > 0) { result.page = p; havePage = true; sawRecognizedKey = true; }
+                }
+            } else if (key == L"dest") {
+                if (!val.empty()) { result.dest = val; haveDest = true; sawRecognizedKey = true; }
+            } else if (key == L"search") {
+                if (!val.empty()) { result.search = val; sawRecognizedKey = true; }
+            } else if (key == L"forwardsearch") {
+                // "<sourcepath>:<line>" -- split at the LAST ':' with an
+                // all-digit tail; a drive letter's colon ("C:") only ever
+                // appears at index 1, never at the end, so this can't
+                // collide with a normal Windows path.
+                size_t colon = val.rfind(L':');
+                if (colon != std::wstring::npos && colon > 0 && colon + 1 < val.size()) {
+                    std::wstring linePart = val.substr(colon + 1);
+                    if (linePart.find_first_not_of(L"0123456789") == std::wstring::npos) {
+                        int line = _wtoi(linePart.c_str());
+                        if (line > 0) {
+                            result.forwardSearchFile = val.substr(0, colon);
+                            result.forwardSearchLine = line;
+                            haveForwardSearch = true;
+                            sawRecognizedKey = true;
+                        }
+                    }
+                }
+            } else if (key == L"pwd") {
+                if (!val.empty()) { result.pwd = val; sawRecognizedKey = true; }
+            }
+            // unrecognized keys are silently ignored (forward-compatible)
+        }
+
+        if (amp == std::wstring::npos) break;
+        start = amp + 1;
+    }
+
+    if (!sawRecognizedKey)
+        return DeepLinkParams(); // nothing usable found; path is left untouched below
+
+    int posCount = (haveForwardSearch ? 1 : 0) + (haveDest ? 1 : 0) + (havePage ? 1 : 0);
+    if (posCount > 1) {
+        // Priority order (forwardsearch > dest > page) decided once here,
+        // rather than being expressed separately in a log-message ternary
+        // and a clearing if/else-if that happened to need to agree with it.
+        const wchar_t* winner = L"page";
+        if (haveForwardSearch) {
+            winner = L"forwardsearch";
+            result.page = -1;
+            result.dest.clear();
+        } else if (haveDest) {
+            winner = L"dest";
+            result.page = -1;
+        }
+        LogF(L"Deep link for %s specifies more than one position command; using %s",
+             base.c_str(), winner);
+    }
+
+    path = base;
+    return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -656,6 +1029,8 @@ static void LaunchSumatraStandalone(const ListerInstance* inst);
 static bool TryFallbackShellOpen(const std::wstring& filePath);
 static LRESULT CALLBACK ErrorWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 static void UnregisterCrashDetection(ListerInstance* inst); // defined just above LaunchSumatraEmbedded
+static bool CopyDiagnosticSnapshotToClipboard(const ListerInstance* inst); // defined near SetClipboardTextW
+static void ShowDiagnosticSnapshot(HWND parentForBox, bool clipboardOk); // defined near SetClipboardTextW; must be called OUTSIDE inst->opLock, see its own comment
 
 static LRESULT CALLBACK HostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
@@ -684,17 +1059,36 @@ static LRESULT CALLBACK HostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             return 0;
         }
         case WM_HOTKEY: {
-            // Fired by RegisterPopOutHotkey's Ctrl+Alt+O registration.
+            // wParam is the id passed to RegisterHotKey, letting us tell
+            // which of this instance's (up to two) hotkeys fired.
             // opLock here matches every other reader of filePath/currentInvert
             // (ListLoadNextW, ListSendCommand) so a hotkey press can't read
             // a half-updated file path mid-relaunch; `closed` skips a stale
             // instance that's mid-teardown.
             ListerInstancePtr inst = FindInstance(hwnd);
+            bool showDiagBox = false;
+            bool diagClipboardOk = false;
+            HWND diagBoxParent = nullptr;
+
             if (inst) {
                 std::lock_guard<std::mutex> opLock(inst->opLock);
-                if (!inst->closed)
-                    LaunchSumatraStandalone(inst.get());
-            }
+                if (!inst->closed) {
+                    if ((int)wParam == inst->popOutHotkeyId) {
+                        LaunchSumatraStandalone(inst.get());
+                    } else if ((int)wParam == inst->diagHotkeyId) {
+                        // Only the data-gathering half runs under the lock;
+                        // the message box itself must not (see
+                        // ShowDiagnosticSnapshot's comment for why).
+                        diagClipboardOk = CopyDiagnosticSnapshotToClipboard(inst.get());
+                        diagBoxParent = inst->hostWnd;
+                        showDiagBox = true;
+                    }
+                }
+            } // opLock released here -- everything below runs without it held
+
+            if (showDiagBox)
+                ShowDiagnosticSnapshot(diagBoxParent, diagClipboardOk);
+
             return 0;
         }
         case WM_SUMATRA_PROCESS_EXITED: {
@@ -848,10 +1242,43 @@ static void AppendArg(std::wstring& cmd, const std::wstring& arg)
     cmd += arg;
 }
 
+// Appends `arg` to `cmd` as a properly quoted, escaped command-line
+// argument, following the same backslash/quote escaping rules
+// CommandLineToArgvW (and therefore every normal C/C++ argv-parsing child
+// process, including SumatraPDF) expects. Produces identical output to a
+// naive '"'+arg+'"' wrap for any argument with no embedded quotes and no
+// backslash run immediately before the end -- i.e. every existing call
+// site (plain file paths, zoom/view strings, printer names) is unaffected
+// -- but correctly escapes the cases that would otherwise let a crafted
+// value break out of its quoting.
 static void AppendQuotedArg(std::wstring& cmd, const std::wstring& arg)
 {
-    cmd += L" \"";
-    cmd += arg;
+    cmd += L' ';
+    cmd += L'"';
+    for (size_t i = 0; i < arg.size(); ) {
+        size_t backslashes = 0;
+        while (i < arg.size() && arg[i] == L'\\') { backslashes++; i++; }
+
+        if (i == arg.size()) {
+            // Backslashes at the very end of the argument: double them, since
+            // our own closing quote immediately follows and would otherwise
+            // be escaped by an odd trailing backslash instead of closing the
+            // argument.
+            cmd.append(backslashes * 2, L'\\');
+            break;
+        } else if (arg[i] == L'"') {
+            // Backslashes immediately before a literal quote: double them,
+            // then escape the quote itself.
+            cmd.append(backslashes * 2 + 1, L'\\');
+            cmd += L'"';
+            i++;
+        } else {
+            // Backslashes not followed by a quote are literal; no escaping needed.
+            cmd.append(backslashes, L'\\');
+            cmd += arg[i];
+            i++;
+        }
+    }
     cmd += L'"';
 }
 
@@ -901,9 +1328,32 @@ static long long HandleToInt64(void* handle)
 //  focus -- so it can shadow the same combo in other applications.
 // ---------------------------------------------------------------------------
 
-static const UINT  POPOUT_HOTKEY_MOD = MOD_CONTROL | MOD_ALT | MOD_NOREPEAT;
-static const UINT  POPOUT_HOTKEY_VK  = 'O';
-static int         g_nextHotkeyId    = 1; // see RegisterPopOutHotkey: protected by g_mutex
+// Appends the CLI flags corresponding to a parsed deep link. Shared by
+// LaunchSumatraStandalone and LaunchSumatraEmbedded so the two launch paths
+// can't drift out of sync with each other.
+static void AppendDeepLinkArgs(std::wstring& cmdLine, const DeepLinkParams& dl)
+{
+    if (dl.forwardSearchLine > 0 && !dl.forwardSearchFile.empty()) {
+        AppendArg(cmdLine, L"-forward-search");
+        AppendQuotedArg(cmdLine, dl.forwardSearchFile);
+        AppendArg(cmdLine, std::to_wstring(dl.forwardSearchLine));
+    } else if (!dl.dest.empty()) {
+        AppendArg(cmdLine, L"-named-dest");
+        AppendQuotedArg(cmdLine, dl.dest);
+    } else if (dl.page > 0) {
+        AppendArg(cmdLine, L"-page");
+        AppendArg(cmdLine, std::to_wstring(dl.page));
+    }
+
+    if (!dl.search.empty()) {
+        AppendArg(cmdLine, L"-search");
+        AppendQuotedArg(cmdLine, dl.search);
+    }
+    if (!dl.pwd.empty()) {
+        AppendArg(cmdLine, L"-pwd");
+        AppendQuotedArg(cmdLine, dl.pwd);
+    }
+}
 
 static void LaunchSumatraStandalone(const ListerInstance* inst)
 {
@@ -912,13 +1362,10 @@ static void LaunchSumatraStandalone(const ListerInstance* inst)
         return;
 
     std::wstring filePath = inst->filePath;
-    int page = ExtractPageSuffix(filePath);
+    DeepLinkParams dl = ExtractDeepLinkParams(filePath);
 
     std::wstring cmdLine = L"\"" + exe + L"\"";
-    if (page > 0) {
-        AppendArg(cmdLine, L"-page");
-        AppendArg(cmdLine, std::to_wstring(page));
-    }
+    AppendDeepLinkArgs(cmdLine, dl);
     if (inst->currentInvert)
         AppendArg(cmdLine, L"-invertcolors");
     AppendQuotedArg(cmdLine, filePath);
@@ -943,16 +1390,23 @@ static void LaunchSumatraStandalone(const ListerInstance* inst)
     }
 }
 
-// Registers the pop-out hotkey for this instance's hostWnd. Idempotent
-// (skips re-registering on every relaunch) and tolerant of failure (e.g.
-// another application already owns Ctrl+Alt+O system-wide) -- pop-out
-// simply stays unavailable for that instance rather than erroring out.
-// Must be called on the same thread that created inst->hostWnd, which is
-// always true here: every caller of LaunchSumatraEmbedded runs on Total
-// Commander's UI thread, same as DoListLoad's CreateWindowExW for hostWnd.
-static void RegisterPopOutHotkey(ListerInstance* inst)
+static const UINT  POPOUT_HOTKEY_MOD = MOD_CONTROL | MOD_ALT | MOD_NOREPEAT;
+static const UINT  POPOUT_HOTKEY_VK  = 'O';
+static const UINT  DIAG_HOTKEY_MOD   = MOD_CONTROL | MOD_ALT | MOD_NOREPEAT;
+static const UINT  DIAG_HOTKEY_VK    = 'D';
+static int         g_nextHotkeyId    = 1; // see RegisterInstanceHotkey: protected by g_mutex
+
+// Registers a system-wide hotkey for this instance's hostWnd, storing the
+// resulting id in *idField. Idempotent (skips re-registering if *idField is
+// already set) and tolerant of failure (e.g. another application already
+// owns the combo) -- the corresponding feature simply stays unavailable for
+// that instance rather than erroring out. Must be called on the same
+// thread that created inst->hostWnd, which is always true here: every
+// caller of LaunchSumatraEmbedded runs on Total Commander's UI thread, same
+// as DoListLoad's CreateWindowExW for hostWnd.
+static void RegisterInstanceHotkey(ListerInstance* inst, int* idField, UINT mod, UINT vk, const wchar_t* comboName)
 {
-    if (!g_config.enablePopOut || inst->hotkeyId != 0 || !inst->hostWnd)
+    if (*idField != 0 || !inst->hostWnd)
         return;
 
     int id;
@@ -961,20 +1415,40 @@ static void RegisterPopOutHotkey(ListerInstance* inst)
         id = g_nextHotkeyId++;
     }
 
-    if (RegisterHotKey(inst->hostWnd, id, POPOUT_HOTKEY_MOD, POPOUT_HOTKEY_VK)) {
-        inst->hotkeyId = id;
+    if (RegisterHotKey(inst->hostWnd, id, mod, vk)) {
+        *idField = id;
     } else {
-        LogF(L"RegisterHotKey for pop-out failed, error %lu "
-             L"(another application may already use Ctrl+Alt+O)", GetLastError());
+        LogF(L"RegisterHotKey for %s failed, error %lu (another application may already use it)",
+             comboName, GetLastError());
     }
 }
 
+static void UnregisterInstanceHotkey(ListerInstance* inst, int* idField)
+{
+    if (*idField != 0 && inst->hostWnd) {
+        UnregisterHotKey(inst->hostWnd, *idField);
+        *idField = 0;
+    }
+}
+
+static void RegisterPopOutHotkey(ListerInstance* inst)
+{
+    if (g_config.enablePopOut)
+        RegisterInstanceHotkey(inst, &inst->popOutHotkeyId, POPOUT_HOTKEY_MOD, POPOUT_HOTKEY_VK, L"Ctrl+Alt+O (pop-out)");
+}
 static void UnregisterPopOutHotkey(ListerInstance* inst)
 {
-    if (inst->hotkeyId != 0 && inst->hostWnd) {
-        UnregisterHotKey(inst->hostWnd, inst->hotkeyId);
-        inst->hotkeyId = 0;
-    }
+    UnregisterInstanceHotkey(inst, &inst->popOutHotkeyId);
+}
+
+static void RegisterDiagnosticHotkey(ListerInstance* inst)
+{
+    if (g_config.enableDiagnosticHotkey)
+        RegisterInstanceHotkey(inst, &inst->diagHotkeyId, DIAG_HOTKEY_MOD, DIAG_HOTKEY_VK, L"Ctrl+Alt+D (diagnostics)");
+}
+static void UnregisterDiagnosticHotkey(ListerInstance* inst)
+{
+    UnregisterInstanceHotkey(inst, &inst->diagHotkeyId);
 }
 
 static bool LaunchSumatraEmbedded(ListerInstance* inst)
@@ -986,7 +1460,7 @@ static bool LaunchSumatraEmbedded(ListerInstance* inst)
     }
 
     std::wstring filePath = inst->filePath;
-    int page = ExtractPageSuffix(filePath); // strips "#page=N" if present
+    DeepLinkParams dl = ExtractDeepLinkParams(filePath); // strips any deep-link suffix if present
 
     wchar_t hwndBuf[32];
     swprintf_s(hwndBuf, L"%lld", HandleToInt64(inst->hostWnd));
@@ -995,17 +1469,22 @@ static bool LaunchSumatraEmbedded(ListerInstance* inst)
     AppendArg(cmdLine, L"-plugin");
     AppendArg(cmdLine, hwndBuf);
 
-    if (page > 0) {
-        AppendArg(cmdLine, L"-page");
-        AppendArg(cmdLine, std::to_wstring(page));
-    }
-    if (!g_config.defaultZoom.empty()) {
+    AppendDeepLinkArgs(cmdLine, dl);
+
+    const PerExtensionOverrides* ov = FindExtensionOverrides(filePath); // computed once, used by both lookups below
+    std::wstring effectiveZoom = GetEffectiveZoom(ov);
+    std::wstring effectiveView = GetEffectiveView(ov);
+    if (!effectiveZoom.empty()) {
         AppendArg(cmdLine, L"-zoom");
-        AppendQuotedArg(cmdLine, g_config.defaultZoom);
+        AppendQuotedArg(cmdLine, effectiveZoom);
     }
-    if (!g_config.defaultView.empty()) {
+    if (!effectiveView.empty()) {
         AppendArg(cmdLine, L"-view");
-        AppendQuotedArg(cmdLine, g_config.defaultView);
+        AppendQuotedArg(cmdLine, effectiveView);
+    }
+    if (!g_config.backgroundColor.empty()) {
+        AppendArg(cmdLine, L"-bg-color");
+        AppendQuotedArg(cmdLine, g_config.backgroundColor);
     }
     if (inst->currentInvert)
         AppendArg(cmdLine, L"-invertcolors");
@@ -1054,6 +1533,7 @@ static bool LaunchSumatraEmbedded(ListerInstance* inst)
 
     inst->sumatraWnd = child;
     RegisterPopOutHotkey(inst);
+    RegisterDiagnosticHotkey(inst);
     RegisterCrashDetection(inst);
 
     RECT rc; GetClientRect(inst->hostWnd, &rc);
@@ -1100,6 +1580,7 @@ static void TeardownInstance(ListerInstance* inst)
 
     CloseRunningSumatraProcess(inst, 1500);
     UnregisterPopOutHotkey(inst);
+    UnregisterDiagnosticHotkey(inst);
 
     if (inst->hostWnd && IsWindow(inst->hostWnd))
         DestroyWindow(inst->hostWnd);
@@ -1119,8 +1600,9 @@ static bool TryFallbackShellOpen(const std::wstring& filePath)
     LogF(L"FallbackToShellOpen: launching default handler for %s", filePath.c_str());
     HINSTANCE result = ShellExecuteW(nullptr, L"open", filePath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
     bool ok = (intptr_t)result > 32; // per ShellExecute convention
-    if (!ok)
-    LogF(L"FallbackToShellOpen failed, ShellExecute returned %lld", HandleToInt64(result));
+    if (!ok) {
+        LogF(L"FallbackToShellOpen failed, ShellExecute returned %lld", HandleToInt64(result));
+    }
     return ok;
 }
 
@@ -1197,7 +1679,12 @@ enum KeyModifier : std::uint8_t { ModNone, ModCtrl, ModShift };
 // == Ctrl+F, SendKeyCombo(ModShift, VK_F3) == Shift+F3.
 static void SendKeyCombo(KeyModifier mod, WORD vk)
 {
-    WORD modVk = (mod == ModCtrl) ? VK_CONTROL : (mod == ModShift) ? VK_SHIFT : 0;
+    WORD modVk = 0;
+    switch (mod) {
+        case ModCtrl:  modVk = VK_CONTROL; break;
+        case ModShift: modVk = VK_SHIFT;   break;
+        case ModNone:  break;
+    }
 
     INPUT down[2] = {};
     int   n = 0;
@@ -1253,6 +1740,96 @@ static bool GetClipboardTextW(std::wstring& out)
     }
     CloseClipboard();
     return ok;
+}
+
+// Builds a plain-text diagnostic snapshot for bug reports: plugin version,
+// build architecture, detected Sumatra path, this instance's file and
+// effective config, and a short tail of the debug log if enabled.
+//
+// Deliberately never includes a deep link's pwd or search values, even
+// though they're known to this instance -- a snapshot meant to be pasted
+// into a public bug report shouldn't carry along a password or search term.
+static std::wstring BuildDiagnosticSnapshot(const ListerInstance* inst)
+{
+    std::wstring s = L"SumatraLister diagnostic snapshot\r\n"
+                      L"==================================\r\n";
+    s += L"Plugin version: " PLUGIN_VERSION L"\r\n";
+#ifdef _WIN64
+    s += L"Build: 64-bit (SumatraLister.wlx64)\r\n";
+#else
+    s += L"Build: 32-bit (SumatraLister.wlx)\r\n";
+#endif
+    const std::wstring& sumatraPath = GetSumatraPath();
+    s += L"Detected SumatraPDF: " + (sumatraPath.empty() ? L"(not found)" : sumatraPath) + L"\r\n";
+
+    if (inst) {
+        std::wstring displayPath = inst->filePath;
+        ExtractDeepLinkParams(displayPath); // strip any deep-link suffix, including any pwd/search it carried
+        s += L"Current file: " + displayPath + L"\r\n";
+        s += L"Embedded process running: "; s += (inst->pi.hProcess ? L"yes" : L"no"); s += L"\r\n";
+        s += L"Invert colors active: "; s += (inst->currentInvert ? L"yes" : L"no"); s += L"\r\n";
+    }
+
+    s += L"\r\nEffective configuration:\r\n";
+    s += L"  SumatraPath override: " + (g_config.sumatraPathOverride.empty() ? L"(auto-detect)" : g_config.sumatraPathOverride) + L"\r\n";
+    s += L"  RestrictMode: "; s += (g_config.restrictMode ? L"1" : L"0"); s += L"\r\n";
+    s += L"  NightMode: "; s += (g_config.nightMode ? L"1" : L"0"); s += L"\r\n";
+    s += L"  AutoNightMode: "; s += (g_config.autoNightMode ? L"1" : L"0"); s += L"\r\n";
+    s += L"  DefaultZoom: " + (g_config.defaultZoom.empty() ? L"(none)" : g_config.defaultZoom) + L"\r\n";
+    s += L"  DefaultView: " + (g_config.defaultView.empty() ? L"(none)" : g_config.defaultView) + L"\r\n";
+    s += L"  BackgroundColor: " + (g_config.backgroundColor.empty() ? L"(none)" : g_config.backgroundColor) + L"\r\n";
+    s += L"  EnabledExtensions: " + (g_config.enabledExtensions.empty() ? L"(all)" : g_config.enabledExtensions) + L"\r\n";
+    s += L"  ThumbnailsEnabled: "; s += (g_config.thumbnailsEnabled ? L"1" : L"0"); s += L"\r\n";
+    s += L"  EmbedTimeoutMs: " + std::to_wstring(g_config.embedTimeoutMs) + L"\r\n";
+    s += L"  FallbackToShellOpen: "; s += (g_config.fallbackShellOpen ? L"1" : L"0"); s += L"\r\n";
+    s += L"  InteractivePrintFallback: "; s += (g_config.interactivePrintFallback ? L"1" : L"0"); s += L"\r\n";
+    s += L"  EnablePopOut: "; s += (g_config.enablePopOut ? L"1" : L"0"); s += L"\r\n";
+    s += L"  Per-extension overrides configured: " + std::to_wstring(g_config.perExtension.size()) + L"\r\n";
+    s += L"  DebugLog: "; s += (g_config.debugLog ? L"1" : L"0"); s += L"\r\n";
+
+    s += L"\r\n";
+    if (g_config.debugLog)
+        s += L"Recent log lines:\r\n" + ReadLogTail(30);
+    else
+        s += L"(DebugLog=0 -- enable it in SumatraLister.ini, reopen the file, and try\r\n"
+             L"again for more detail here.)\r\n";
+
+    return s;
+}
+
+// The data-gathering half of Ctrl+Alt+D: builds the snapshot and copies it
+// to the clipboard. Deliberately does NOT show the confirmation message
+// box itself -- this must be safe to call while inst->opLock is held (it
+// reads inst's fields), whereas the message box must NOT be shown under
+// that lock. See ShowDiagnosticSnapshot below for why.
+static bool CopyDiagnosticSnapshotToClipboard(const ListerInstance* inst)
+{
+    std::wstring snapshot = BuildDiagnosticSnapshot(inst);
+    return SetClipboardTextW(snapshot);
+}
+
+// The actual Ctrl+Alt+D action: copies the snapshot to the clipboard, then
+// confirms with a brief message box (this is a deliberate, user-initiated
+// action where "did it work" feedback matters, unlike the other
+// hotkey-forwarded actions in this file which stay silent).
+//
+// Deliberately takes a plain HWND, not a ListerInstance*: MessageBoxW is
+// modal and blocks for as long as the user leaves it open, which is fine
+// on its own (it's a normal, expected part of a UI-thread message loop,
+// the same as any other modal dialog a hotkey-triggered utility might
+// show) but must NOT happen while inst->opLock is held, since that would
+// mean any OTHER operation on this same pane -- closing it, navigating to
+// the next file, a find/copy command, even pressing this same hotkey again
+// -- would block on that same lock for however long the user leaves the
+// confirmation dialog open. Callers must copy the snapshot (which does
+// need the lock) via CopyDiagnosticSnapshotToClipboard first, release the
+// lock, and only then call this.
+static void ShowDiagnosticSnapshot(HWND parentForBox, bool clipboardOk)
+{
+    MessageBoxW(parentForBox,
+                clipboardOk ? L"Diagnostic snapshot copied to clipboard. Paste it into your bug report."
+                            : L"Could not access the clipboard to copy the diagnostic snapshot.",
+                L"SumatraLister", static_cast<UINT>(MB_OK | (clipboardOk ? MB_ICONINFORMATION : MB_ICONWARNING)));
 }
 
 // Opens Sumatra's find bar and executes a search for `text`, honoring the
@@ -1400,11 +1977,25 @@ static int DoListPrint(const std::wstring& fileToPrint, const std::wstring& prin
 
     std::wstring cmdLine = L"\"" + exe + L"\"";
 
-    if (printerName.empty()) {
-        AppendArg(cmdLine, L"-print-to-default");
+    if (g_config.interactivePrintFallback) {
+        // Interactive (new default): show Sumatra's own print dialog
+        // (printer/page-range/copies choice), matching the SDK's documented
+        // expectation for ListPrint far more faithfully than silent
+        // printing does. -exit-when-done closes Sumatra automatically once
+        // the user finishes, rather than leaving a now-pointless window open.
+        AppendArg(cmdLine, L"-print-dialog");
+        AppendArg(cmdLine, L"-exit-when-done");
     } else {
-        AppendArg(cmdLine, L"-print-to");
-        AppendQuotedArg(cmdLine, printerName);
+        // Legacy silent mode: for scripted/automated printing that can't
+        // have a dialog popping up unattended. -silent suppresses Sumatra's
+        // own error UI, which would otherwise have nobody there to dismiss it.
+        if (printerName.empty()) {
+            AppendArg(cmdLine, L"-print-to-default");
+        } else {
+            AppendArg(cmdLine, L"-print-to");
+            AppendQuotedArg(cmdLine, printerName);
+        }
+        AppendArg(cmdLine, L"-silent");
     }
 
     if (!g_config.printSettings.empty()) {
@@ -1416,7 +2007,7 @@ static int DoListPrint(const std::wstring& fileToPrint, const std::wstring& prin
 
     AppendQuotedArg(cmdLine, fileToPrint);
 
-    LogF(L"Printing: %s", cmdLine.c_str());
+    LogF(L"Printing (%s mode): %s", g_config.interactivePrintFallback ? L"interactive" : L"silent", cmdLine.c_str());
 
     std::vector<wchar_t> cmdBuf(cmdLine.begin(), cmdLine.end());
     cmdBuf.push_back(L'\0');
@@ -1424,18 +2015,36 @@ static int DoListPrint(const std::wstring& fileToPrint, const std::wstring& prin
     STARTUPINFOW si = {};
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
+    si.wShowWindow = g_config.interactivePrintFallback ? SW_SHOWNORMAL : SW_HIDE;
 
     PROCESS_INFORMATION pi = {};
     BOOL ok = CreateProcessW(exe.c_str(), cmdBuf.data(), nullptr, nullptr, FALSE,
-                              CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+                              g_config.interactivePrintFallback ? 0 : CREATE_NO_WINDOW,
+                              nullptr, nullptr, &si, &pi);
     if (!ok) {
         LogF(L"Print CreateProcess failed, error %lu", GetLastError());
         return LISTPLUGIN_ERROR;
     }
 
-    // -print-to[-default] makes Sumatra print and exit on its own; wait
-    // (bounded) for that exit so TC's print dialog/status reflects completion.
+    if (g_config.interactivePrintFallback) {
+        // Fire-and-forget, matching LaunchSumatraStandalone's pattern: this
+        // must NOT block waiting for the user to interact with and dismiss
+        // the dialog, since ListPrint is called synchronously from Total
+        // Commander -- waiting for arbitrary, user-paced interaction would
+        // make TC's own UI appear frozen for however long that takes.
+        // Success is reported optimistically once the dialog is launched;
+        // the dialog itself gives the user direct feedback if the print
+        // job doesn't go as expected.
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        return LISTPLUGIN_OK;
+    }
+
+    // Silent mode: -print-to[-default] makes Sumatra print and exit on its
+    // own; wait (bounded) for that exit so TC's print status reflects
+    // completion. No human is involved in this path, so a short, fixed
+    // timeout is meaningful here in a way it wouldn't be for the
+    // interactive dialog above.
     DWORD waitResult = WaitForSingleObject(pi.hProcess, 60000);
 
     if (waitResult == WAIT_TIMEOUT) {
@@ -1489,12 +2098,28 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
 // --- ListGetDetectString --------------------------------------------------
 __declspec(dllexport) void __stdcall ListGetDetectString(char* DetectString, int maxlen)
 {
-    static const char* detect =
-        "EXT=\"PDF\" | EXT=\"CHM\" | EXT=\"DJVU\" | EXT=\"EPUB\" | "
-        "EXT=\"FB2\" | EXT=\"FB2Z\" | EXT=\"MOBI\" | EXT=\"PRC\" | "
-        "EXT=\"XPS\" | EXT=\"OXPS\" | "
-        "EXT=\"CB7\" | EXT=\"CBR\" | EXT=\"CBT\" | EXT=\"CBZ\"";
-    lstrcpynA(DetectString, detect, maxlen);
+    LoadConfig(); // EnabledExtensions must be loaded before building this
+
+    // Built once from kSupportedExtensions (all pure-ASCII, so the direct
+    // wchar_t->char narrowing below is safe) filtered by EnabledExtensions;
+    // computed on first call and reused after, since EnabledExtensions
+    // can't change during the plugin's lifetime (no live INI reload).
+    static const std::string detect = [] {
+        std::string s;
+        bool first = true;
+        for (const wchar_t* ext : kSupportedExtensions) {
+            if (!IsExtensionEnabled(ext))
+                continue;
+            if (!first) s += " | ";
+            first = false;
+            s += "EXT=\"";
+            for (const wchar_t* p = ext; *p; p++) s += (char)*p;
+            s += "\"";
+        }
+        return s;
+    }();
+
+    lstrcpynA(DetectString, detect.c_str(), maxlen);
 }
 
 // --- core loader, shared by ANSI and Unicode entry points ----------------
@@ -1518,7 +2143,18 @@ static HWND DoListLoad(HWND ParentWin, const std::wstring& fileName)
     inst->hostWnd       = host;
     inst->parentWin     = ParentWin;
     inst->filePath      = fileName;
-    inst->currentInvert = g_config.autoNightMode ? false : g_config.nightMode; // AutoNightMode decides later via LC_NEWPARAMS
+    // Extension detection for GetEffectiveStaticNightMode needs the actual
+    // file path, not the raw fileName -- which might still carry a
+    // deep-link suffix that could itself contain a dot (e.g. a
+    // forwardsearch value referencing some_file.tex) or, on a real file
+    // with a literal '#' in its name, might not need stripping at all.
+    // Reusing ExtractDeepLinkParams' own stripping logic on a throwaway
+    // copy keeps this consistent with how the suffix is actually
+    // interpreted later in LaunchSumatraEmbedded, rather than duplicating
+    // subtly-different logic here.
+    std::wstring extCheckPath = fileName;
+    ExtractDeepLinkParams(extCheckPath); // discards the parsed params; only the stripped path is needed here
+    inst->currentInvert = GetEffectiveStaticNightMode(extCheckPath); // AutoNightMode decides later via LC_NEWPARAMS
 
     {
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -1823,7 +2459,7 @@ __declspec(dllexport) int __stdcall ListPrintW(
         std::lock_guard<std::mutex> opLock(inst->opLock);
         if (!inst->closed && inst->sumatraWnd && IsWindow(inst->sumatraWnd)) {
             std::wstring currentFile = inst->filePath;
-            ExtractPageSuffix(currentFile); // strip any "#page=N" so the comparison matches the real path
+            ExtractDeepLinkParams(currentFile); // strip any deep-link suffix so the comparison matches the real path
             if (_wcsicmp(currentFile.c_str(), FileToPrint) == 0) {
                 ForwardPrintDialogToSumatra(inst.get());
                 return LISTPLUGIN_OK;

@@ -13,7 +13,7 @@ add_library(SumatraLister SHARED
     SumatraLister.def
 )
 
-target_link_libraries(SumatraLister PRIVATE shlwapi user32 advapi32 shell32)
+target_link_libraries(SumatraLister PRIVATE shlwapi user32 advapi32 shell32 ole32 gdi32)
 
 # Produce SumatraLister.wlx for 32-bit builds and SumatraLister.wlx64 for
 # 64-bit builds, matching Total Commander's plugin-bitness naming convention.
