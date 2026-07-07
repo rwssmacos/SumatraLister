@@ -1,4 +1,4 @@
-# By adding in this file with the build in archive will promp to auto install the archive if double clicked from within total commander. 
+# By adding in this file with the build in a archive will promp to auto install the archive if double clicked from within total commander. 
 
 [plugininstall]
 description=SumatraLister for Total Commander
