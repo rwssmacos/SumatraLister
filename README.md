@@ -234,6 +234,20 @@ each fix site in the source):
   on another tool's implicit default-library behavior to begin with. Fixed
   by adding both explicitly; verified with a real CMake-driven MinGW build
   (configure + compile + link, not just a manual compiler invocation).
+- The `forwardsearch=` deep-link parameter built its `-forward-search`
+  command line using the same "file path goes as the ordinary trailing
+  argument" convention `-page`/`-named-dest` use — but Sumatra's official
+  command-line reference confirms `-forward-search` actually takes the PDF
+  as its own third argument (`-forward-search "<sourcepath>" <line>
+  "<pdfpath>"`), unlike those other flags. An earlier version of this
+  README flagged this specific detail as an open, unconfirmed question
+  rather than fixing it outright; it's now been looked up properly and
+  corrected, with the file path no longer duplicated on the command line
+  when a forward-search link is used. Verified with a focused test that
+  inspects the actual constructed command line for several cases
+  (plain page, forward-search alone, forward-search combined with a search
+  term, and a named-destination regression check), confirming the PDF path
+  appears exactly once in each case and in the right argument position.
 
 ## How it works
 
@@ -442,17 +456,15 @@ PDF, CHM, DJVU, EPUB, FB2, FB2Z, MOBI, PRC, XPS, OXPS, CB7, CBR, CBT, CBZ
   without live cross-version testing risked silently wrong (clipped) output
   — worse than the current, explicit no-op. Use `PrintSettings=` in the INI
   if you need specific margins.
-- The `forwardsearch=` deep-link parameter's exact argument shape to
-  Sumatra's `-forward-search` switch has one point of genuine ambiguity:
-  Sumatra's own documentation shows this switch both with and without an
-  explicit third `<pdfpath>` argument (the other two being the source file
-  and line number) in different examples. This plugin always supplies the
-  PDF via the ordinary trailing file argument — the same convention
-  `-page`/`-zoom`/`-view` already rely on here — and does not pass a third
-  argument to `-forward-search` itself. This is expected to work based on
-  that convention, but hasn't been confirmed against a real forward-search
-  workflow; if it doesn't work as expected for you, that argument shape is
-  the first thing to check with `SumatraPDF.exe -h` against your version.
+- The `forwardsearch=` deep-link parameter passes the PDF to
+  `-forward-search` as its own third argument (`-forward-search
+  "<sourcepath>" <line> "<pdfpath>"`), confirmed against Sumatra's official
+  command-line reference — this is different from `-page`/`-named-dest`,
+  which apply to whatever file is given via the ordinary trailing argument
+  instead. An earlier version of this plugin used the trailing-argument
+  convention for `-forward-search` too, based on an unconfirmed reading of
+  the documentation; this has since been corrected, and the file path is
+  no longer duplicated on the command line when a forward-search link is used.
 - Deep-link values (destination names, search terms, LaTeX source paths,
   passwords) go through a properly-escaping command-line quoting routine
   (matching `CommandLineToArgvW`'s parsing rules) rather than naive

@@ -1328,15 +1328,28 @@ static long long HandleToInt64(void* handle)
 //  focus -- so it can shadow the same combo in other applications.
 // ---------------------------------------------------------------------------
 
-// Appends the CLI flags corresponding to a parsed deep link. Shared by
-// LaunchSumatraStandalone and LaunchSumatraEmbedded so the two launch paths
-// can't drift out of sync with each other.
-static void AppendDeepLinkArgs(std::wstring& cmdLine, const DeepLinkParams& dl)
+// Appends the CLI flags corresponding to a parsed deep link, given the
+// already-stripped path of the file being opened. Returns true if the file
+// path was already included as part of what was appended here (this
+// happens only for -forward-search, whose third argument per Sumatra's own
+// documented syntax -- "-forward-search <sourcepath> <line> <pdfpath>",
+// confirmed against the official command-line reference -- IS the file to
+// open, unlike -page/-named-dest/-search which apply to whatever file is
+// given separately via the ordinary trailing argument). Callers must NOT
+// also append filePath as a separate trailing argument when this returns
+// true, or the file would appear twice on the command line. Shared by
+// LaunchSumatraStandalone and LaunchSumatraEmbedded so the two launch
+// paths can't drift out of sync with each other.
+static bool AppendDeepLinkArgs(std::wstring& cmdLine, const DeepLinkParams& dl, const std::wstring& filePath)
 {
+    bool filePathAlreadyIncluded = false;
+
     if (dl.forwardSearchLine > 0 && !dl.forwardSearchFile.empty()) {
         AppendArg(cmdLine, L"-forward-search");
         AppendQuotedArg(cmdLine, dl.forwardSearchFile);
         AppendArg(cmdLine, std::to_wstring(dl.forwardSearchLine));
+        AppendQuotedArg(cmdLine, filePath);
+        filePathAlreadyIncluded = true;
     } else if (!dl.dest.empty()) {
         AppendArg(cmdLine, L"-named-dest");
         AppendQuotedArg(cmdLine, dl.dest);
@@ -1353,6 +1366,8 @@ static void AppendDeepLinkArgs(std::wstring& cmdLine, const DeepLinkParams& dl)
         AppendArg(cmdLine, L"-pwd");
         AppendQuotedArg(cmdLine, dl.pwd);
     }
+
+    return filePathAlreadyIncluded;
 }
 
 static void LaunchSumatraStandalone(const ListerInstance* inst)
@@ -1365,10 +1380,11 @@ static void LaunchSumatraStandalone(const ListerInstance* inst)
     DeepLinkParams dl = ExtractDeepLinkParams(filePath);
 
     std::wstring cmdLine = L"\"" + exe + L"\"";
-    AppendDeepLinkArgs(cmdLine, dl);
+    bool filePathIncluded = AppendDeepLinkArgs(cmdLine, dl, filePath);
     if (inst->currentInvert)
         AppendArg(cmdLine, L"-invertcolors");
-    AppendQuotedArg(cmdLine, filePath);
+    if (!filePathIncluded)
+        AppendQuotedArg(cmdLine, filePath);
 
     LogF(L"Pop-out: launching standalone Sumatra: %s", cmdLine.c_str());
 
@@ -1469,7 +1485,7 @@ static bool LaunchSumatraEmbedded(ListerInstance* inst)
     AppendArg(cmdLine, L"-plugin");
     AppendArg(cmdLine, hwndBuf);
 
-    AppendDeepLinkArgs(cmdLine, dl);
+    bool filePathIncluded = AppendDeepLinkArgs(cmdLine, dl, filePath);
 
     const PerExtensionOverrides* ov = FindExtensionOverrides(filePath); // computed once, used by both lookups below
     std::wstring effectiveZoom = GetEffectiveZoom(ov);
@@ -1493,7 +1509,8 @@ static bool LaunchSumatraEmbedded(ListerInstance* inst)
     if (!g_config.extraArgs.empty())
         AppendArg(cmdLine, g_config.extraArgs);
 
-    AppendQuotedArg(cmdLine, filePath);
+    if (!filePathIncluded)
+        AppendQuotedArg(cmdLine, filePath);
 
     LogF(L"Launching: %s", cmdLine.c_str());
 
